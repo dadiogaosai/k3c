@@ -133,7 +133,8 @@ func Resume(cfg *config.Config) error {
 	if err := setActive(cfg); err != nil {
 		return err
 	}
-	logger.Info("cluster '" + cfg.Cluster + "' resumed (public ingress/registry now route here)")
+	_, _ = runOut("kubectl", "config", "use-context", cfg.KubeContext)
+	logger.Info("cluster '" + cfg.Cluster + "' resumed (kube context and public routing switched)")
 	return nil
 }
 
