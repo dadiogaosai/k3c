@@ -466,16 +466,24 @@ func List(cfg *config.Config) error {
 		if parts["-server"] == "" {
 			continue
 		}
+		server := parts["-server"]
 		registry := parts["-registry"]
 		if registry == "" {
 			registry = "-"
+		}
+		// a paused cluster's containers still report "running"
+		if _, err := os.Stat(filepath.Join(cfg.BaseDir, "clusters", cluster, "paused")); err == nil {
+			server = "paused"
+			if registry != "-" {
+				registry = "paused"
+			}
 		}
 		// resolve per cluster: picks up its persisted project config
 		context := cfg.ContextPrefix() + cluster
 		if clusterCfg, err := config.Resolve(cluster, ""); err == nil {
 			context = clusterCfg.KubeContext
 		}
-		fmt.Printf("%-16s %-10s %-10s %s\n", cluster, parts["-server"], registry, context)
+		fmt.Printf("%-16s %-10s %-10s %s\n", cluster, server, registry, context)
 	}
 	return nil
 }
