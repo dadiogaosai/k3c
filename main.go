@@ -3,8 +3,13 @@
 // container runtime instead of Docker.
 package main
 
-import "k3c/cmd"
+import (
+	"k3c/cmd"
+
+	"github.com/philipparndt/go-logger"
+)
 
 func main() {
+	logger.Init("debug", logger.Logger())
 	cmd.Execute()
 }
