@@ -101,6 +101,7 @@ func SnapshotSave(cfg *config.Config, name string) error {
 		return fmt.Errorf("snapshot '%s' already exists for cluster '%s'", name, cfg.Cluster)
 	}
 
+	resumeIfPaused(cfg)
 	wasRunning := containerExists(cfg.ServerName, true)
 	if wasRunning {
 		logger.Info("stopping cluster for a consistent snapshot")
@@ -167,6 +168,7 @@ func SnapshotRestore(cfg *config.Config, name string) error {
 		return fmt.Errorf("cluster '%s' does not exist; create it first (the snapshot restores its state, not the container)", cfg.Cluster)
 	}
 
+	resumeIfPaused(cfg)
 	if containerExists(cfg.ServerName, true) {
 		logger.Info("stopping cluster")
 		_, _ = runOut("container", "stop", cfg.ServerName)

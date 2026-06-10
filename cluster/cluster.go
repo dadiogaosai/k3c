@@ -364,6 +364,7 @@ func persistProjectConfig(cfg *config.Config) error {
 
 // Delete removes a cluster, its state, and its kubeconfig entries.
 func Delete(cfg *config.Config) error {
+	resumeIfPaused(cfg)
 	logger.Info("removing containers")
 	_, _ = runOut("container", "rm", "-f", cfg.ServerName)
 	_, _ = runOut("container", "rm", "-f", cfg.RegistryName)
@@ -378,6 +379,7 @@ func Delete(cfg *config.Config) error {
 
 // Stop stops a cluster's containers, preserving all state.
 func Stop(cfg *config.Config) error {
+	resumeIfPaused(cfg)
 	logger.Info("stopping cluster '" + cfg.Cluster + "' (state is preserved)")
 	_, _ = runOut("container", "stop", cfg.ServerName)
 	_, _ = runOut("container", "stop", cfg.RegistryName)
@@ -457,6 +459,9 @@ func Status(cfg *config.Config) error {
 		} else {
 			fmt.Printf("%s: stopped\n", name)
 		}
+	}
+	if isPaused(cfg) {
+		fmt.Println("--- cluster is PAUSED (in memory; k3c cluster resume) ---")
 	}
 	fmt.Println("--- containers ---")
 	out, _ := runOut("container", "ls", "-a")

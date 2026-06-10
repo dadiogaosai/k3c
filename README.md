@@ -56,8 +56,15 @@ k3c cluster create [NAME]     k3c kubeconfig get   [NAME]
 k3c cluster delete [NAME]     k3c kubeconfig merge [NAME]
 k3c cluster start  [NAME]     k3c config view [NAME]
 k3c cluster stop   [NAME]     k3c status [NAME]
-k3c cluster list              k3c version
+k3c cluster pause  [NAME]     k3c version
+k3c cluster resume [NAME]     k3c image import IMAGE
+k3c cluster list
 ```
+
+`pause`/`resume` freeze the cluster VM in memory: resuming takes well under
+a second and every pod keeps running — no restart cascade, no crash-loop
+backoffs. A paused cluster frees CPU but keeps its memory allocated, and
+does not survive a host reboot (use `stop`/`start` or snapshots for that).
 
 Multiple clusters are supported; only one can *run* at a time (they share
 the published host ports). `stop`/`start` preserves cluster state.
