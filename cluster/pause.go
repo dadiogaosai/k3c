@@ -76,7 +76,11 @@ func Pause(cfg *config.Config) error {
 	if registryPids, err := vmProcessPIDs(cfg.RegistryName); err == nil {
 		pids = append(pids, registryPids...)
 	}
+	alreadyFrozen := true
 	for _, pid := range pids {
+		if !processStopped(pid) {
+			alreadyFrozen = false
+		}
 		if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
 			return fmt.Errorf("freezing pid %d: %w", pid, err)
 		}
@@ -91,9 +95,19 @@ func Pause(cfg *config.Config) error {
 	if err := os.WriteFile(pausedMarker(cfg), []byte(strings.Join(fields, " ")), 0o644); err != nil {
 		return err
 	}
+	if alreadyFrozen {
+		logger.Info("cluster '" + cfg.Cluster + "' is already paused")
+		return nil
+	}
 	logger.Info("cluster '" + cfg.Cluster + "' paused (in memory); resume with: k3c cluster resume " + cfg.Cluster)
 	logger.Info("note: a paused cluster does not survive a host reboot")
 	return nil
+}
+
+// processStopped reports whether a process is currently frozen (SIGSTOP).
+func processStopped(pid int) bool {
+	out, err := runOut("ps", "-o", "stat=", "-p", strconv.Itoa(pid))
+	return err == nil && strings.HasPrefix(strings.TrimSpace(out), "T")
 }
 
 // Resume unfreezes a paused cluster.
