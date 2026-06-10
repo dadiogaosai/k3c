@@ -182,7 +182,6 @@ registries: |                  # verbatim k3s registries.yaml
 
 - macOS 26+ on Apple Silicon
 - [Apple `container`](https://github.com/apple/container) **>= 1.0.0**
-  (earlier versions cannot pull images behind VPNs)
 - `kubectl`
 
 ## License
