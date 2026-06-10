@@ -1,0 +1,435 @@
+// Package cluster manages k3s clusters on Apple `container`.
+package cluster
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/philipparndt/go-logger"
+
+	"k3c/config"
+)
+
+// runOut executes a command and returns its combined output.
+func runOut(name string, args ...string) (string, error) {
+	out, err := exec.Command(name, args...).CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+func preflight() error {
+	for _, tool := range []string{"container", "kubectl"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			return fmt.Errorf("%s is not installed", tool)
+		}
+	}
+	out, err := runOut("container", "--version")
+	if err != nil {
+		return fmt.Errorf("container CLI not working: %s", out)
+	}
+	if strings.Contains(out, "version 0.") {
+		return fmt.Errorf("container CLI >= 1.0.0 required")
+	}
+	if _, err := runOut("container", "system", "status"); err != nil {
+		if out, err := runOut("container", "system", "start"); err != nil {
+			return fmt.Errorf("could not start container system: %s", out)
+		}
+	}
+	return nil
+}
+
+// containerExists reports whether a container with this exact name exists
+// (running when runningOnly is set).
+func containerExists(name string, runningOnly bool) bool {
+	args := []string{"ls", "--format", "json"}
+	if !runningOnly {
+		args = []string{"ls", "-a", "--format", "json"}
+	}
+	out, _ := runOut("container", args...)
+	return strings.Contains(out, `"`+name+`"`)
+}
+
+// otherRunningServer returns the name of a foreign <cluster>-server
+// container that is currently running, if any.
+func otherRunningServer(cfg *config.Config) string {
+	out, _ := runOut("container", "ls")
+	for _, line := range strings.Split(out, "\n")[1:] {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && strings.HasSuffix(fields[0], "-server") && fields[0] != cfg.ServerName {
+			return fields[0]
+		}
+	}
+	return ""
+}
+
+func startRegistry(cfg *config.Config) error {
+	if !cfg.RegistryEnabled {
+		return nil
+	}
+	if containerExists(cfg.RegistryName, true) {
+		logger.Info("local registry already running")
+		return nil
+	}
+	_, _ = runOut("container", "rm", "-f", cfg.RegistryName)
+	logger.Info("starting local registry on port " + cfg.RegistryPort)
+	out, err := runOut("container", "run", "-d",
+		"--name", cfg.RegistryName,
+		"-p", "0.0.0.0:"+cfg.RegistryPort+":5000",
+		"docker.io/registry:2")
+	if err != nil {
+		return fmt.Errorf("registry start failed: %s", out)
+	}
+	return nil
+}
+
+// prepareNodeConfig writes the bind-mounted /etc/rancher/k3s content: the
+// registries.yaml from the config, and a CA bundle of the host's system
+// roots plus any configured certificates (ca-bundle.pem, which the
+// registries config may reference).
+func prepareNodeConfig(cfg *config.Config) error {
+	logger.Info("preparing node config (registries.yaml, CA bundle)")
+	etc := cfg.K3sEtcDir()
+	if err := os.MkdirAll(etc, 0o755); err != nil {
+		return err
+	}
+	_ = os.Remove(filepath.Join(etc, "k3s.yaml"))
+	if cfg.Registries != "" {
+		if err := os.WriteFile(filepath.Join(etc, "registries.yaml"), []byte(cfg.Registries), 0o644); err != nil {
+			return err
+		}
+	}
+	bundle, err := os.ReadFile("/etc/ssl/cert.pem")
+	if err != nil {
+		return fmt.Errorf("reading system CA bundle: %w", err)
+	}
+	for _, glob := range cfg.CACertGlobs {
+		matches, err := filepath.Glob(glob)
+		if err != nil {
+			return err
+		}
+		if len(matches) == 0 {
+			return fmt.Errorf("no CA certificates match %s", glob)
+		}
+		for _, crt := range matches {
+			data, err := os.ReadFile(crt)
+			if err != nil {
+				return err
+			}
+			bundle = append(bundle, '\n')
+			bundle = append(bundle, data...)
+		}
+	}
+	return os.WriteFile(filepath.Join(etc, "ca-bundle.pem"), bundle, 0o644)
+}
+
+func startServer(cfg *config.Config) error {
+	logger.Info(fmt.Sprintf("starting k3s server (%s cpus, %s memory)", cfg.CPUs, cfg.Memory))
+	proxyURL := fmt.Sprintf("http://%s:%s", cfg.VmnetGateway, cfg.ProxyPort)
+	out, err := runOut("container", "run", "-d",
+		"--name", cfg.ServerName,
+		// k3s remounts /sys, mounts cgroups, etc. — needs full capabilities
+		"--cap-add", "ALL",
+		// amd64-only images run via Rosetta binfmt, matching Docker Desktop
+		"--rosetta",
+		"-m", cfg.Memory,
+		"-c", cfg.CPUs,
+		"--tmpfs", "/run",
+		"--tmpfs", "/var/run",
+		"-v", cfg.K3sEtcDir()+":/etc/rancher/k3s",
+		"-e", "HTTP_PROXY="+proxyURL,
+		"-e", "HTTPS_PROXY="+proxyURL,
+		"-e", "NO_PROXY="+cfg.NoProxy(),
+		"-p", "0.0.0.0:6443:6443",
+		"-p", "127.0.0.1:"+cfg.IngressPort+":443",
+		"--entrypoint", "/bin/sh",
+		cfg.Image,
+		"-c", cfg.K3sCommand())
+	if err != nil {
+		return fmt.Errorf("k3s start failed: %s", out)
+	}
+	return nil
+}
+
+// kubeconfig reads the kubeconfig k3s wrote into the bind mount
+// (container exec/cp hang once k3s runs, hence the mount), renames the
+// identifiers, and points the server at the published port. With wait set
+// it polls for up to two minutes (cluster creation).
+func kubeconfig(cfg *config.Config, wait bool) (string, error) {
+	path := filepath.Join(cfg.K3sEtcDir(), "k3s.yaml")
+	attempts := 1
+	if wait {
+		attempts = 60
+	}
+	var raw []byte
+	for i := 0; i < attempts; i++ {
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			raw = data
+			break
+		}
+		if wait {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	if len(raw) == 0 {
+		return "", fmt.Errorf("no kubeconfig at %s; check: container logs %s", path, cfg.ServerName)
+	}
+	kc := string(raw)
+	kc = strings.ReplaceAll(kc, ": default", ": "+cfg.KubeContext)
+	if cfg.APIHost != "127.0.0.1" {
+		kc = strings.ReplaceAll(kc,
+			"server: https://127.0.0.1:6443", "server: https://"+cfg.APIHost+":6443")
+	}
+	return kc, nil
+}
+
+// KubeconfigGet prints the cluster's kubeconfig to stdout.
+func KubeconfigGet(cfg *config.Config) error {
+	kc, err := kubeconfig(cfg, false)
+	if err != nil {
+		return err
+	}
+	fmt.Print(kc)
+	return nil
+}
+
+// KubeconfigMerge merges the cluster's kubeconfig into ~/.kube/config and
+// switches the current context.
+func KubeconfigMerge(cfg *config.Config) error {
+	logger.Info("waiting for kubeconfig")
+	kc, err := kubeconfig(cfg, true)
+	if err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp("", "k3c-kubeconfig-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(kc); err != nil {
+		return err
+	}
+	tmp.Close()
+
+	logger.Info("merging kubeconfig (context: " + cfg.KubeContext + ")")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	kubeDir := filepath.Join(home, ".kube")
+	kubeConfig := filepath.Join(kubeDir, "config")
+	if err := os.MkdirAll(kubeDir, 0o755); err != nil {
+		return err
+	}
+	if _, err := os.Stat(kubeConfig); err == nil {
+		if data, err := os.ReadFile(kubeConfig); err == nil {
+			_ = os.MkdirAll(cfg.RunDir(), 0o755)
+			_ = os.WriteFile(filepath.Join(cfg.RunDir(), "kubeconfig.backup"), data, 0o600)
+		}
+		merge := exec.Command("kubectl", "config", "view", "--flatten")
+		merge.Env = append(os.Environ(), "KUBECONFIG="+tmp.Name()+":"+kubeConfig)
+		merged, err := merge.Output()
+		if err != nil {
+			return fmt.Errorf("kubeconfig merge failed: %w", err)
+		}
+		if err := os.WriteFile(kubeConfig, merged, 0o600); err != nil {
+			return err
+		}
+	} else {
+		if err := os.WriteFile(kubeConfig, []byte(kc), 0o600); err != nil {
+			return err
+		}
+	}
+	_, err = runOut("kubectl", "config", "use-context", cfg.KubeContext)
+	return err
+}
+
+func kubectl(cfg *config.Config, args ...string) (string, error) {
+	return runOut("kubectl", append([]string{"--context", cfg.KubeContext}, args...)...)
+}
+
+func waitReady(cfg *config.Config) error {
+	logger.Info("waiting for node to become Ready")
+	for i := 0; i < 60; i++ {
+		out, err := kubectl(cfg, "get", "nodes")
+		if err == nil && strings.Contains(out, " Ready") {
+			fmt.Println(out)
+			return nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("node did not become Ready; check: container logs %s", cfg.ServerName)
+}
+
+// setupCoreDNS applies the egress DNS override, if egress domains are
+// configured. The coredns deployment is created asynchronously by the k3s
+// addon controller, so wait for it first.
+func setupCoreDNS(cfg *config.Config) error {
+	manifest := cfg.CorednsCustom()
+	if manifest == "" {
+		return nil
+	}
+	logger.Info("configuring CoreDNS egress override")
+	for i := 0; i < 60; i++ {
+		if _, err := kubectl(cfg, "-n", "kube-system", "get", "deployment", "coredns"); err == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	apply := exec.Command("kubectl", "--context", cfg.KubeContext, "apply", "-f", "-")
+	apply.Stdin = strings.NewReader(manifest)
+	if out, err := apply.CombinedOutput(); err != nil {
+		return fmt.Errorf("coredns-custom apply failed: %s", out)
+	}
+	if out, err := kubectl(cfg, "-n", "kube-system", "rollout", "restart", "deployment", "coredns"); err != nil {
+		return fmt.Errorf("coredns restart failed: %s", out)
+	}
+	if out, err := kubectl(cfg, "-n", "kube-system", "rollout", "status", "deployment", "coredns", "--timeout=300s"); err != nil {
+		return fmt.Errorf("coredns rollout: %s", out)
+	}
+	return nil
+}
+
+// Create creates and starts a new cluster.
+func Create(cfg *config.Config) error {
+	if err := preflight(); err != nil {
+		return err
+	}
+	if containerExists(cfg.ServerName, false) {
+		return fmt.Errorf("cluster '%s' already exists; run delete (or start) first", cfg.Cluster)
+	}
+	if other := otherRunningServer(cfg); other != "" {
+		return fmt.Errorf("cluster container '%s' is running; stop it first (clusters share host ports)", other)
+	}
+	if err := SpawnDaemons(cfg); err != nil {
+		return err
+	}
+	if err := startRegistry(cfg); err != nil {
+		return err
+	}
+	if err := prepareNodeConfig(cfg); err != nil {
+		return err
+	}
+	if err := startServer(cfg); err != nil {
+		return err
+	}
+	if err := KubeconfigMerge(cfg); err != nil {
+		return err
+	}
+	if err := waitReady(cfg); err != nil {
+		return err
+	}
+	if err := setupCoreDNS(cfg); err != nil {
+		return err
+	}
+	logger.Info("cluster is up (context: " + cfg.KubeContext + ")")
+	return nil
+}
+
+// Delete removes a cluster, its state, and its kubeconfig entries.
+func Delete(cfg *config.Config) error {
+	logger.Info("removing containers")
+	_, _ = runOut("container", "rm", "-f", cfg.ServerName)
+	_, _ = runOut("container", "rm", "-f", cfg.RegistryName)
+	StopDaemons(cfg)
+	for _, kind := range []string{"delete-context", "delete-cluster", "delete-user"} {
+		_, _ = runOut("kubectl", "config", kind, cfg.KubeContext)
+	}
+	_ = os.RemoveAll(cfg.RunDir())
+	logger.Info("deleted")
+	return nil
+}
+
+// Stop stops a cluster's containers, preserving all state.
+func Stop(cfg *config.Config) error {
+	logger.Info("stopping cluster '" + cfg.Cluster + "' (state is preserved)")
+	_, _ = runOut("container", "stop", cfg.ServerName)
+	_, _ = runOut("container", "stop", cfg.RegistryName)
+	logger.Info("stopped; resume with: k3c cluster start " + cfg.Cluster)
+	return nil
+}
+
+// Start resumes a stopped cluster.
+func Start(cfg *config.Config) error {
+	if err := preflight(); err != nil {
+		return err
+	}
+	if other := otherRunningServer(cfg); other != "" {
+		return fmt.Errorf("cluster container '%s' is running; stop it first (clusters share host ports)", other)
+	}
+	if err := SpawnDaemons(cfg); err != nil {
+		return err
+	}
+	_, _ = runOut("container", "start", cfg.RegistryName)
+	if out, err := runOut("container", "start", cfg.ServerName); err != nil {
+		return fmt.Errorf("start failed: %s", out)
+	}
+	_, _ = runOut("kubectl", "config", "use-context", cfg.KubeContext)
+	if err := waitReady(cfg); err != nil {
+		return err
+	}
+	logger.Info("cluster '" + cfg.Cluster + "' resumed (context: " + cfg.KubeContext + ")")
+	return nil
+}
+
+// List prints all k3c clusters (containers named <cluster>-server) with
+// their server/registry state.
+func List(cfg *config.Config) error {
+	out, _ := runOut("container", "ls", "-a")
+	state := map[string]map[string]string{}
+	for _, line := range strings.Split(out, "\n")[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		name, st := fields[0], fields[4]
+		for _, suffix := range []string{"-server", "-registry"} {
+			if strings.HasSuffix(name, suffix) {
+				cluster := strings.TrimSuffix(name, suffix)
+				if state[cluster] == nil {
+					state[cluster] = map[string]string{}
+				}
+				state[cluster][suffix] = st
+			}
+		}
+	}
+	fmt.Printf("%-16s %-10s %-10s %s\n", "NAME", "SERVER", "REGISTRY", "CONTEXT")
+	for cluster, parts := range state {
+		if parts["-server"] == "" {
+			continue
+		}
+		registry := parts["-registry"]
+		if registry == "" {
+			registry = "-"
+		}
+		fmt.Printf("%-16s %-10s %-10s %s\n", cluster, parts["-server"], registry, cfg.ContextPrefix()+cluster)
+	}
+	return nil
+}
+
+// Status prints daemon, container, and node state for a cluster.
+func Status(cfg *config.Config) error {
+	fmt.Println("--- host daemons ---")
+	for name, pidFile := range map[string]string{"proxy": cfg.ProxyPidFile(), "sni-gateway": cfg.SNIPidFile()} {
+		if pidAlive(pidFile) {
+			fmt.Printf("%s: running\n", name)
+		} else {
+			fmt.Printf("%s: stopped\n", name)
+		}
+	}
+	fmt.Println("--- containers ---")
+	out, _ := runOut("container", "ls", "-a")
+	for i, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if i == 0 || (len(fields) > 0 && (fields[0] == cfg.ServerName || fields[0] == cfg.RegistryName)) {
+			fmt.Println(line)
+		}
+	}
+	fmt.Println("--- nodes ---")
+	nodes, _ := kubectl(cfg, "get", "nodes")
+	fmt.Println(nodes)
+	return nil
+}

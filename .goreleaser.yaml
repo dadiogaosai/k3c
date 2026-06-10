@@ -1,0 +1,49 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    # Apple `container` only exists on macOS
+    goos:
+      - darwin
+    goarch:
+      - arm64
+      - amd64
+    ldflags:
+      - -s -w -X k3c/version.Version={{.Version}} -X k3c/version.GitCommit={{.Commit}} -X k3c/version.BuildDate={{.Date}}
+
+release:
+  github:
+    owner: philipparndt
+    name: k3c
+
+archives:
+  - formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+brews:
+  - name: k3c
+    homepage: https://github.com/philipparndt/k3c
+    description: "Local k3s clusters on Apple container — like k3d, without Docker"
+    repository:
+      owner: philipparndt
+      name: homebrew-k3c
+      branch: main
+      pull_request:
+        enabled: false
