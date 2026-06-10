@@ -45,6 +45,12 @@ real destination from the host's network. TLS stays end-to-end.
 ## Install
 
 ```sh
+brew install philipparndt/k3c/k3c
+```
+
+Or from source:
+
+```sh
 make install        # /usr/local/bin
 make install-user   # GOPATH/bin, no sudo
 ```
