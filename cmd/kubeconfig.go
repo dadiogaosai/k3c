@@ -16,7 +16,7 @@ var kubeconfigGetCmd = &cobra.Command{
 	Short: "Print the cluster's kubeconfig to stdout",
 	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		fail(cluster.KubeconfigGet(loadConfig(args)))
+		fail(cluster.KubeconfigGet(loadConfigDefault(args)))
 	},
 }
 
@@ -26,7 +26,7 @@ var kubeconfigMergeCmd = &cobra.Command{
 	Short:   "Merge into ~/.kube/config and switch the current context",
 	Args:    cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		fail(cluster.KubeconfigMerge(loadConfig(args)))
+		fail(cluster.KubeconfigMerge(loadConfigDefault(args)))
 	},
 }
 

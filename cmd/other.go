@@ -14,7 +14,7 @@ var statusCmd = &cobra.Command{
 	Short: "Show cluster, daemon, and node status",
 	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		fail(cluster.Status(loadConfig(args)))
+		fail(cluster.Status(loadConfigDefault(args)))
 	},
 }
 
