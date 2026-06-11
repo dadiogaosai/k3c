@@ -43,6 +43,9 @@ type FileConfig struct {
 		// host (balloon-capable container builds): a duration like "10m",
 		// or "off" (default: 10m)
 		AutoReclaim string `yaml:"autoReclaim"`
+		// scheduling priority of the cluster VMs relative to interactive
+		// apps: "low" (clamped below GUI apps, default) or "normal"
+		CPUPriority string `yaml:"cpuPriority"`
 	} `yaml:"cluster"`
 	Ports struct {
 		Ingress int `yaml:"ingress"` // host port the cluster's :443 is published on
@@ -110,6 +113,7 @@ type Config struct {
 
 	ContainerBinary string // the Apple container CLI to use
 	AutoReclaim     string // auto-reclaim interval ("off" disables)
+	CPUPriority     string // "low" (default) or "normal"
 
 	BaseDir    string // state directory (~/.config/k3c)
 	ConfigFile string // project config in effect, for daemon respawn
@@ -187,6 +191,7 @@ func merge(dst *FileConfig, src FileConfig) {
 	i(&dst.LocalRegistry.HostPort, src.LocalRegistry.HostPort)
 	s(&dst.ContainerBinary, src.ContainerBinary)
 	s(&dst.Cluster.AutoReclaim, src.Cluster.AutoReclaim)
+	s(&dst.Cluster.CPUPriority, src.Cluster.CPUPriority)
 	l(&dst.CACerts, src.CACerts)
 	l(&dst.Egress.Domains, src.Egress.Domains)
 	l(&dst.Egress.IngressDomains, src.Egress.IngressDomains)
@@ -323,6 +328,7 @@ func Resolve(cluster, projectPath string) (*Config, error) {
 		Registries:           fc.Registries,
 		ContainerBinary:      def(fc.ContainerBinary, "container"),
 		AutoReclaim:          def(fc.Cluster.AutoReclaim, "10m"),
+		CPUPriority:          def(fc.Cluster.CPUPriority, "low"),
 		BaseDir:              baseDir,
 		ConfigFile:           configFile,
 	}, nil

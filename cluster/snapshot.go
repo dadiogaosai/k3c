@@ -192,6 +192,7 @@ func SnapshotSave(cfg *config.Config, name string, cold bool) error {
 		if out, err := runContainer("start", cfg.ServerName); err != nil {
 			return fmt.Errorf("snapshot saved, but restart failed: %s", out)
 		}
+		applyCPUPriority(cfg)
 	}
 	mode := "cold"
 	if warm {

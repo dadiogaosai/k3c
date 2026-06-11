@@ -154,6 +154,7 @@ func Resume(cfg *config.Config) error {
 			return err
 		}
 		_, _ = runOut("kubectl", "config", "use-context", cfg.KubeContext)
+		applyCPUPriority(cfg)
 		logger.Info("cluster '" + cfg.Cluster + "' resumed (kube context and public routing switched)")
 		return nil
 	}

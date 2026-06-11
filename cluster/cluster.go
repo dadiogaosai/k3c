@@ -397,6 +397,7 @@ func Create(cfg *config.Config) error {
 	if err := startServer(cfg); err != nil {
 		return err
 	}
+	applyCPUPriority(cfg)
 	if err := KubeconfigMerge(cfg); err != nil {
 		return err
 	}
@@ -480,6 +481,7 @@ func Start(cfg *config.Config) error {
 		}
 	}
 	_, _ = runOut("kubectl", "config", "use-context", cfg.KubeContext)
+	applyCPUPriority(cfg)
 	for attempt := 0; ; attempt++ {
 		err := postStart(cfg)
 		if err == nil {
