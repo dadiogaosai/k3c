@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -24,5 +26,45 @@ func TestK3sCommandContainsSysctls(t *testing.T) {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("k3s command missing %q:\n%s", want, cmd)
 		}
+	}
+}
+
+// A project k3c.yaml found in the working directory must only apply to its
+// own cluster: resolving a different named cluster from that directory must
+// not inherit (or later overwrite) the project's settings.
+func TestProjectConfigForeignCluster(t *testing.T) {
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "k3c.yaml"),
+		[]byte("cluster:\n  name: vehub\n  contextPrefix: k3d-\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(project)
+	t.Setenv("K3C_BASE_DIR", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("K3C_CONFIG", "")
+
+	foreign, err := Resolve("k3c", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if foreign.KubeContext != "k3c-k3c" || foreign.ConfigFile != "" {
+		t.Errorf("foreign cluster inherited project config: context=%s configFile=%s",
+			foreign.KubeContext, foreign.ConfigFile)
+	}
+
+	own, err := Resolve("vehub", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if own.KubeContext != "k3d-vehub" {
+		t.Errorf("own cluster did not pick up project config: context=%s", own.KubeContext)
+	}
+
+	def, err := Resolve("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.Cluster != "vehub" {
+		t.Errorf("default resolution did not use the project cluster: %s", def.Cluster)
 	}
 }

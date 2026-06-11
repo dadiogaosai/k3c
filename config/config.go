@@ -240,16 +240,21 @@ func Resolve(cluster, projectPath string) (*Config, error) {
 		explicit = os.Getenv("K3C_CONFIG") != ""
 	}
 	configFile := ""
-	if project, err := loadFile(projectPath); err == nil {
+	if project, err := loadFile(projectPath); err == nil &&
+		(explicit || cluster == "" || project.Cluster.Name == "" || project.Cluster.Name == cluster) {
+		// an implicitly found ./k3c.yaml only applies to its own cluster:
+		// starting a DIFFERENT named cluster from this directory must not
+		// inherit (or overwrite) this project's settings
 		merge(&fc, project)
 		if abs, err := filepath.Abs(projectPath); err == nil {
 			configFile = abs
 		}
-	} else if explicit || !os.IsNotExist(err) {
+	} else if err != nil && (explicit || !os.IsNotExist(err)) {
 		return nil, err
 	} else if cluster != "" {
-		// no project config here, but the cluster may have one persisted
-		// from create — lets start/stop/kubeconfig work from any directory
+		// no project config applies here, but the cluster may have one
+		// persisted from create — lets start/stop/kubeconfig work from any
+		// directory
 		persisted := filepath.Join(baseDir, "clusters", cluster, "k3c.yaml")
 		if project, err := loadFile(persisted); err == nil {
 			merge(&fc, project)
