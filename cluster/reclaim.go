@@ -67,11 +67,15 @@ func Reclaim(cfg *config.Config, release bool) error {
 		return fmt.Errorf("dropping caches failed: %s", out)
 	}
 
-	usedMB, err := guestUsedMB(cfg)
+	totalMB, usedMB, _, err := guestMemMB(cfg)
 	if err != nil {
 		return err
 	}
 	target := usedMB + reclaimHeadroomMB(usedMB)
+	if target >= totalMB {
+		logger.Info(fmt.Sprintf("guest uses %dMB of %dMB; nothing to reclaim", usedMB, totalMB))
+		return nil
+	}
 	logger.Info(fmt.Sprintf("reclaiming (guest uses %dMB, balloon target %dMB)", usedMB, target))
 	if out, err := runContainer("memory", "target", cfg.ServerName,
 		fmt.Sprintf("%dm", target)); err != nil {
@@ -104,22 +108,34 @@ func Reclaim(cfg *config.Config, release bool) error {
 	return nil
 }
 
-// guestUsedMB returns the used memory inside the cluster's VM in MiB.
-func guestUsedMB(cfg *config.Config) (int, error) {
+// guestMemMB returns total, used, and available memory inside the
+// cluster's VM in MiB. Note that inflated balloon pages count as used and
+// reduce available.
+func guestMemMB(cfg *config.Config) (total, used, available int, err error) {
 	out, err := runContainer("exec", cfg.ServerName,
-		"sh", "-c", "free -m | awk '/^Mem:/{print $3}'")
+		"sh", "-c", "free -m | awk '/^Mem:/{print $2, $3, $7}'")
 	if err != nil {
-		return 0, fmt.Errorf("reading guest memory usage failed: %s", out)
+		return 0, 0, 0, fmt.Errorf("reading guest memory failed: %s", out)
 	}
 	fields := strings.Fields(strings.TrimSpace(out))
-	if len(fields) == 0 {
-		return 0, fmt.Errorf("unexpected free output: %q", out)
+	if len(fields) < 3 {
+		return 0, 0, 0, fmt.Errorf("unexpected free output: %q", out)
 	}
-	used, err := strconv.Atoi(fields[len(fields)-1])
-	if err != nil {
-		return 0, fmt.Errorf("unexpected free output: %q", out)
+	vals := make([]int, 3)
+	for i := 0; i < 3; i++ {
+		v, err := strconv.Atoi(fields[len(fields)-3+i])
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("unexpected free output: %q", out)
+		}
+		vals[i] = v
 	}
-	return used, nil
+	return vals[0], vals[1], vals[2], nil
+}
+
+// guestUsedMB returns the used memory inside the cluster's VM in MiB.
+func guestUsedMB(cfg *config.Config) (int, error) {
+	_, used, _, err := guestMemMB(cfg)
+	return used, err
 }
 
 // footprintMB returns the cluster VM's physical footprint in MiB, or -1.

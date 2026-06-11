@@ -28,12 +28,27 @@ func startAutoReclaim(cfg *config.Config) {
 	}
 	logger.Info("auto-reclaim every " + interval.String())
 	go func() {
+		// The balloon never deflates on its own: a workload growing into a
+		// squeezed target suffocates the guest (memory pressure, reclaim
+		// churn). Check for pressure every minute and re-size immediately;
+		// the footprint-drift check runs on the configured interval.
+		const pressureCheck = time.Minute
+		elapsed := time.Duration(0)
 		for {
-			time.Sleep(interval)
-			autoReclaimTick()
+			time.Sleep(pressureCheck)
+			elapsed += pressureCheck
+			drift := elapsed >= interval
+			if drift {
+				elapsed = 0
+			}
+			autoReclaimTick(drift)
 		}
 	}()
 }
+
+// pressureFloorMB is the guest-available threshold below which the balloon
+// is re-sized immediately, regardless of footprint drift.
+const pressureFloorMB = 2048
 
 // autoReclaimInterval parses the config value: a duration enables the
 // loop, "off"/"false"/"0" disable it.
@@ -63,7 +78,7 @@ func autoReclaimDriftMB(targetMB int) int {
 	return 4096
 }
 
-func autoReclaimTick() {
+func autoReclaimTick(drift bool) {
 	for name, parts := range clusterStates() {
 		if parts["-server"] != "running" {
 			continue
@@ -72,10 +87,27 @@ func autoReclaimTick() {
 		if cfg == nil || isPaused(cfg) {
 			continue
 		}
-		used, err := guestUsedMB(cfg)
+		_, used, available, err := guestMemMB(cfg)
 		if err != nil {
 			continue
 		}
+		// A guest under memory pressure needs the balloon re-sized NOW:
+		// Reclaim deflates first, giving everything back instantly, then
+		// re-measures the real usage and sizes the new target from it.
+		if available < pressureFloorMB {
+			logger.Warn(fmt.Sprintf("auto-reclaim %s: guest memory pressure (%dMB available), re-sizing balloon", name, available))
+			if err := Reclaim(cfg, false); err != nil {
+				logger.Warn("auto-reclaim " + name + ": " + err.Error())
+			}
+			continue
+		}
+		if !drift {
+			continue
+		}
+		// NOTE: used includes inflated balloon pages, overstating the
+		// target after a squeeze — fine for this check: post-squeeze the
+		// footprint sits near the target anyway, so drift stays low until
+		// the balloon is deflated (restart) or pressure re-sizes it.
 		target := used + reclaimHeadroomMB(used)
 		fp := footprintMB(name)
 		if fp < 0 || fp-target < autoReclaimDriftMB(target) {
