@@ -123,23 +123,23 @@ func SnapshotSave(cfg *config.Config, name string) error {
 	wasRunning := containerExists(cfg.ServerName, true)
 	if wasRunning {
 		logger.Info("stopping cluster for a consistent snapshot")
-		_, _ = runOut(containerBinary(), "stop", cfg.ServerName)
-		_, _ = runOut(containerBinary(), "stop", cfg.RegistryName)
+		_, _ = runContainer("stop", cfg.ServerName)
+		_, _ = runContainer("stop", cfg.RegistryName)
 	}
 
 	if err := writeSnapshot(cfg, dir); err != nil {
 		_ = os.RemoveAll(dir)
 		if wasRunning {
-			_, _ = runOut(containerBinary(), "start", cfg.RegistryName)
-			_, _ = runOut(containerBinary(), "start", cfg.ServerName)
+			_, _ = runContainer("start", cfg.RegistryName)
+			_, _ = runContainer("start", cfg.ServerName)
 		}
 		return err
 	}
 
 	if wasRunning {
 		logger.Info("restarting cluster")
-		_, _ = runOut(containerBinary(), "start", cfg.RegistryName)
-		if out, err := runOut(containerBinary(), "start", cfg.ServerName); err != nil {
+		_, _ = runContainer("start", cfg.RegistryName)
+		if out, err := runContainer("start", cfg.ServerName); err != nil {
 			return fmt.Errorf("snapshot saved, but restart failed: %s", out)
 		}
 	}
@@ -197,8 +197,8 @@ func SnapshotRestore(cfg *config.Config, name string) error {
 	resumeIfPaused(cfg)
 	if containerExists(cfg.ServerName, true) {
 		logger.Info("stopping cluster")
-		_, _ = runOut(containerBinary(), "stop", cfg.ServerName)
-		_, _ = runOut(containerBinary(), "stop", cfg.RegistryName)
+		_, _ = runContainer("stop", cfg.ServerName)
+		_, _ = runContainer("stop", cfg.RegistryName)
 	}
 
 	dst, err := containerRootfsPath(cfg.ServerName)

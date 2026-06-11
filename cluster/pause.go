@@ -115,14 +115,14 @@ func processStopped(pid int) bool {
 
 // pauseNative pauses via the container CLI (forks supporting pause).
 func pauseNative(cfg *config.Config) error {
-	if out, err := runOut(containerBinary(), "pause", cfg.ServerName); err != nil {
+	if out, err := runContainer("pause", cfg.ServerName); err != nil {
 		if strings.Contains(out, "not running") {
 			logger.Info("cluster '" + cfg.Cluster + "' is already paused")
 			return nil
 		}
 		return fmt.Errorf("pause failed: %s", out)
 	}
-	_, _ = runOut(containerBinary(), "pause", cfg.RegistryName)
+	_, _ = runContainer("pause", cfg.RegistryName)
 	if err := os.MkdirAll(cfg.RunDir(), 0o755); err != nil {
 		return err
 	}
@@ -141,10 +141,10 @@ func Resume(cfg *config.Config) error {
 		return fmt.Errorf("cluster '%s' is not paused", cfg.Cluster)
 	}
 	if strings.TrimSpace(string(data)) == "native" {
-		if out, err := runOut(containerBinary(), "resume", cfg.ServerName); err != nil {
+		if out, err := runContainer("resume", cfg.ServerName); err != nil {
 			return fmt.Errorf("resume failed: %s", out)
 		}
-		_, _ = runOut(containerBinary(), "resume", cfg.RegistryName)
+		_, _ = runContainer("resume", cfg.RegistryName)
 		_ = os.Remove(pausedMarker(cfg))
 		_ = loadPorts(cfg)
 		if err := waitReady(cfg); err != nil {
@@ -185,8 +185,8 @@ func resumeIfPaused(cfg *config.Config) {
 	if data, err := os.ReadFile(pausedMarker(cfg)); err == nil {
 		logger.Info("cluster is paused, resuming first")
 		if strings.TrimSpace(string(data)) == "native" {
-			_, _ = runOut(containerBinary(), "resume", cfg.ServerName)
-			_, _ = runOut(containerBinary(), "resume", cfg.RegistryName)
+			_, _ = runContainer("resume", cfg.ServerName)
+			_, _ = runContainer("resume", cfg.RegistryName)
 			_ = os.Remove(pausedMarker(cfg))
 			return
 		}
@@ -211,10 +211,10 @@ func Suspend(cfg *config.Config) error {
 		return fmt.Errorf("cluster '%s' is not running", cfg.Cluster)
 	}
 	logger.Info("suspending cluster '" + cfg.Cluster + "' to disk")
-	if out, err := runOut(containerBinary(), "suspend", cfg.ServerName); err != nil {
+	if out, err := runContainer("suspend", cfg.ServerName); err != nil {
 		return fmt.Errorf("suspend failed: %s", out)
 	}
-	_, _ = runOut(containerBinary(), "suspend", cfg.RegistryName)
+	_, _ = runContainer("suspend", cfg.RegistryName)
 	logger.Info("cluster '" + cfg.Cluster + "' suspended (CPU and memory released, survives reboots)")
 	logger.Info("restore with: k3c cluster start " + cfg.Cluster)
 	return nil
