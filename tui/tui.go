@@ -305,6 +305,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "z":
 		return m.startOp("suspend "+name, "cluster", "suspend", name)
 
+	case "m":
+		return m.startOp("memory reclaim of "+name, "cluster", "reclaim", name)
+	case "M":
+		return m.startOp("memory release of "+name, "cluster", "reclaim", name, "--release")
+
 	case "c", "n":
 		in := textinput.New()
 		in.Placeholder = time.Now().Format("2006-01-02-1504")
@@ -534,7 +539,7 @@ func (m model) helpView() string {
 	keys := []string{
 		"↑↓ move", "⇥ pane", "↵ activate/restore",
 		"s start", "S stop", "p pause", "r resume", "z suspend",
-		"c snapshot", "d delete", "o output", "q quit",
+		"m reclaim", "M release", "c snapshot", "d delete", "o output", "q quit",
 	}
 	return dimSt.Render(" " + strings.Join(keys, " · "))
 }
