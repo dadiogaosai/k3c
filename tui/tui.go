@@ -53,11 +53,12 @@ type nameInput struct {
 type model struct {
 	cfg *config.Config
 
-	clusters  []cluster.ClusterInfo
-	snapshots []cluster.SnapshotInfo
-	cCur      int
-	sCur      int
-	focus     pane
+	clusters     []cluster.ClusterInfo
+	snapshots    []cluster.SnapshotInfo
+	snapsLoading bool // snapshots of the newly selected cluster in flight
+	cCur         int
+	sCur         int
+	focus        pane
 
 	width  int
 	height int
@@ -94,6 +95,9 @@ func Run(cfg *config.Config) error {
 type dataMsg struct {
 	clusters  []cluster.ClusterInfo
 	snapshots []cluster.SnapshotInfo
+	// the cluster the snapshots were listed for: a reply that raced a
+	// newer selection must not overwrite its snapshots
+	forCluster string
 }
 
 // opEventMsg streams a running operation: progress lines while it runs,
@@ -132,7 +136,23 @@ func (m model) refresh() tea.Cmd {
 		if current == "" && len(clusters) > 0 {
 			current = clusters[0].Name
 		}
-		return dataMsg{clusters: clusters, snapshots: cluster.Snapshots(cfg, current)}
+		return dataMsg{clusters: clusters, snapshots: cluster.Snapshots(cfg, current), forCluster: current}
+	}
+}
+
+// snapsMsg carries a snapshots-only reload (cluster navigation).
+type snapsMsg struct {
+	snapshots  []cluster.SnapshotInfo
+	forCluster string
+}
+
+// refreshSnapshots reloads only the selected cluster's snapshots — a
+// directory listing, fast enough for cursor navigation, unlike the full
+// cluster state refresh.
+func (m model) refreshSnapshots() tea.Cmd {
+	cfg, name := m.cfg, m.selectedCluster()
+	return func() tea.Msg {
+		return snapsMsg{snapshots: cluster.Snapshots(cfg, name), forCluster: name}
 	}
 }
 
@@ -213,12 +233,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case dataMsg:
 		m.clusters = msg.clusters
-		m.snapshots = msg.snapshots
 		if m.cCur >= len(m.clusters) {
 			m.cCur = max(0, len(m.clusters)-1)
 		}
-		if m.sCur >= len(m.snapshots) {
-			m.sCur = max(0, len(m.snapshots)-1)
+		// only accept snapshots fetched for the current selection
+		if msg.forCluster == m.selectedCluster() {
+			m.snapshots = msg.snapshots
+			m.snapsLoading = false
+			if m.sCur >= len(m.snapshots) {
+				m.sCur = max(0, len(m.snapshots)-1)
+			}
+		}
+		return m, nil
+
+	case snapsMsg:
+		if msg.forCluster == m.selectedCluster() {
+			m.snapshots = msg.snapshots
+			m.snapsLoading = false
+			if m.sCur >= len(m.snapshots) {
+				m.sCur = max(0, len(m.snapshots)-1)
+			}
 		}
 		return m, nil
 
@@ -450,7 +484,10 @@ func (m model) move(delta int) (tea.Model, tea.Cmd) {
 		}
 		m.cCur = next
 		m.sCur = 0
-		return m, m.refresh()
+		// never show the previous cluster's snapshots while loading
+		m.snapshots = nil
+		m.snapsLoading = true
+		return m, m.refreshSnapshots()
 	}
 	next := m.sCur + delta
 	if next < 0 || next >= len(m.snapshots) {
@@ -596,6 +633,10 @@ func (m model) snapshotsView(width int) string {
 	var b strings.Builder
 	name := m.selectedCluster()
 	b.WriteString(titleSt.Render("Snapshots") + dimSt.Render(" of "+name) + "\n")
+	if m.snapsLoading {
+		b.WriteString(m.spin.View() + dimSt.Render(" loading…"))
+		return b.String()
+	}
 	if len(m.snapshots) == 0 {
 		b.WriteString(dimSt.Render("no snapshots — press c to create one"))
 		return b.String()
