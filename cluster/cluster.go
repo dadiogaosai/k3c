@@ -403,10 +403,12 @@ func Create(cfg *config.Config) error {
 	if err := waitReady(cfg); err != nil {
 		return err
 	}
-	if err := setupCoreDNS(cfg); err != nil {
+	// register the webhook before the coredns setup: a failed rollout must
+	// not leave a cluster that silently admits pods with full requests
+	if err := applyIgnoreCPUWebhook(cfg); err != nil {
 		return err
 	}
-	if err := applyIgnoreCPUWebhook(cfg); err != nil {
+	if err := setupCoreDNS(cfg); err != nil {
 		return err
 	}
 	if err := setActive(cfg); err != nil {
@@ -519,11 +521,13 @@ func postStart(cfg *config.Config) error {
 	if err := waitReady(cfg); err != nil {
 		return err
 	}
-	// re-apply so egress config changes take effect on a restart
-	if err := setupCoreDNS(cfg); err != nil {
+	// webhook first: a failed coredns rollout must not leave a cluster
+	// that silently admits pods with full requests
+	if err := applyIgnoreCPUWebhook(cfg); err != nil {
 		return err
 	}
-	return applyIgnoreCPUWebhook(cfg)
+	// re-apply so egress config changes take effect on a restart
+	return setupCoreDNS(cfg)
 }
 
 // clusterStates maps cluster names to their server/registry container
