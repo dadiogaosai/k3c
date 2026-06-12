@@ -536,10 +536,18 @@ func (m model) statusView() string {
 }
 
 func (m model) helpView() string {
-	keys := []string{
-		"↑↓ move", "⇥ pane", "↵ activate/restore",
-		"s start", "S stop", "p pause", "r resume", "z suspend",
-		"m reclaim", "M release", "c snapshot", "d delete", "o output", "q quit",
+	var keys []string
+	if m.focus == paneClusters {
+		keys = []string{
+			"↑↓ move", "⇥ snapshots", "↵ activate",
+			"s start", "S stop", "p pause", "r resume", "z suspend",
+			"m reclaim", "M release", "c snapshot", "o output", "q quit",
+		}
+	} else {
+		keys = []string{
+			"↑↓ move", "⇥ clusters", "↵ restore",
+			"c create", "d delete", "o output", "q quit",
+		}
 	}
 	return dimSt.Render(" " + strings.Join(keys, " · "))
 }
