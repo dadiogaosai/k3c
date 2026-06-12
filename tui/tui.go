@@ -320,7 +320,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, textinput.Blink
 
 	case "d", "x":
-		if m.focus != paneSnapshots {
+		if m.focus == paneClusters {
+			m.confirm = &confirm{
+				prompt: fmt.Sprintf("DELETE cluster %q and all its state? Snapshots are kept.", name),
+				cmd:    m.opCmd("delete of cluster "+name, "cluster", "delete", name),
+			}
 			return m, nil
 		}
 		snap := m.selectedSnapshot()
@@ -541,7 +545,7 @@ func (m model) helpView() string {
 		keys = []string{
 			"↑↓ move", "⇥ snapshots", "↵ activate",
 			"s start", "S stop", "p pause", "r resume", "z suspend",
-			"m reclaim", "M release", "c snapshot", "o output", "q quit",
+			"m reclaim", "M release", "c snapshot", "d delete", "o output", "q quit",
 		}
 	} else {
 		keys = []string{
