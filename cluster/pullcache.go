@@ -267,6 +267,130 @@ func (p *pullCache) fetchContent(ns, name, kind, ref, digest, accept string) err
 	return os.Rename(tmp.Name(), p.blobPath(digest))
 }
 
+// PullCacheList prints the cached images with digest and size.
+func PullCacheList(cfg *config.Config) error {
+	base := filepath.Join(pullCacheDir(cfg), "tags")
+	type row struct{ image, digest, size string }
+	var rows []row
+	_ = filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(base, path)
+		if err != nil {
+			return nil
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		if len(parts) < 3 {
+			return nil
+		}
+		ns, name, tag := parts[0], strings.Join(parts[1:len(parts)-1], "/"), parts[len(parts)-1]
+		digest := ""
+		if data, err := os.ReadFile(path); err == nil {
+			digest = strings.TrimSpace(string(data))
+		}
+		size := "-"
+		if bytes, complete := cachedImageSize(cfg, digest, 0); bytes > 0 {
+			size = fmt.Sprintf("%.1f MB", float64(bytes)/1e6)
+			if !complete {
+				size += "+"
+			}
+		}
+		rows = append(rows, row{ns + "/" + name + ":" + tag, digest, size})
+		return nil
+	})
+	if len(rows) == 0 {
+		fmt.Println("pull cache is empty")
+		return nil
+	}
+	fmt.Printf("%-70s %-18s %s\n", "IMAGE", "DIGEST", "CACHED")
+	for _, r := range rows {
+		short := strings.TrimPrefix(r.digest, "sha256:")
+		if len(short) > 12 {
+			short = short[:12]
+		}
+		fmt.Printf("%-70s %-18s %s\n", r.image, short, r.size)
+	}
+	return nil
+}
+
+// cachedImageSize sums the cached bytes reachable from a manifest digest
+// (config + layers, or the children of an index). complete is false when
+// referenced content is not in the cache.
+func cachedImageSize(cfg *config.Config, digest string, depth int) (bytes int64, complete bool) {
+	if digest == "" || depth > 2 {
+		return 0, false
+	}
+	data, err := os.ReadFile(filepath.Join(pullCacheDir(cfg), "blobs", digest))
+	if err != nil {
+		return 0, false
+	}
+	var manifest struct {
+		Config struct {
+			Size int64 `json:"size"`
+		} `json:"config"`
+		Layers []struct {
+			Size int64 `json:"size"`
+		} `json:"layers"`
+		Manifests []struct {
+			Digest string `json:"digest"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return 0, false
+	}
+	bytes = int64(len(data))
+	complete = true
+	if len(manifest.Layers) > 0 {
+		bytes += manifest.Config.Size
+		for _, layer := range manifest.Layers {
+			bytes += layer.Size
+		}
+		return bytes, true
+	}
+	for _, child := range manifest.Manifests {
+		childBytes, childComplete := cachedImageSize(cfg, child.Digest, depth+1)
+		bytes += childBytes
+		if !childComplete {
+			complete = false
+		}
+	}
+	return bytes, complete
+}
+
+// PullCacheInfo prints blob count and total cache size.
+func PullCacheInfo(cfg *config.Config) error {
+	var count int
+	var total int64
+	_ = filepath.WalkDir(pullCacheDir(cfg), func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			count++
+			total += info.Size()
+		}
+		return nil
+	})
+	fmt.Printf("%s: %d objects, %.1f GB\n", pullCacheDir(cfg), count, float64(total)/1e9)
+	return nil
+}
+
+// PullCacheClear empties the pull cache (the daemons recreate paths as
+// needed on the next download).
+func PullCacheClear(cfg *config.Config) error {
+	if err := os.RemoveAll(pullCacheDir(cfg)); err != nil {
+		return err
+	}
+	for _, dir := range []string{"blobs", "types", "tags"} {
+		if err := os.MkdirAll(filepath.Join(pullCacheDir(cfg), dir), 0o755); err != nil {
+			return err
+		}
+	}
+	logger.Info("pull cache cleared")
+	return nil
+}
+
 // upstreamRequest performs a registry request against the first working
 // upstream endpoint for the namespace, handling the bearer token dance.
 func (p *pullCache) upstreamRequest(method, ns, name, kind, ref, accept string) (*http.Response, error) {

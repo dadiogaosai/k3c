@@ -20,7 +20,41 @@ var imageImportCmd = &cobra.Command{
 	},
 }
 
+var pullCacheCmd = &cobra.Command{
+	Use:   "pull-cache",
+	Short: "Inspect the pull-through registry cache (shared across clusters)",
+}
+
+var pullCacheListCmd = &cobra.Command{
+	Use:     "list",
+	Aliases: []string{"ls"},
+	Short:   "List the cached images",
+	Args:    cobra.NoArgs,
+	Run: func(cmd *cobra.Command, args []string) {
+		fail(cluster.PullCacheList(loadConfigDefault(nil)))
+	},
+}
+
+var pullCacheInfoCmd = &cobra.Command{
+	Use:   "info",
+	Short: "Show pull cache object count and size",
+	Args:  cobra.NoArgs,
+	Run: func(cmd *cobra.Command, args []string) {
+		fail(cluster.PullCacheInfo(loadConfigDefault(nil)))
+	},
+}
+
+var pullCacheClearCmd = &cobra.Command{
+	Use:   "clear",
+	Short: "Empty the pull cache",
+	Args:  cobra.NoArgs,
+	Run: func(cmd *cobra.Command, args []string) {
+		fail(cluster.PullCacheClear(loadConfigDefault(nil)))
+	},
+}
+
 func init() {
-	imageCmd.AddCommand(imageImportCmd)
+	pullCacheCmd.AddCommand(pullCacheListCmd, pullCacheInfoCmd, pullCacheClearCmd)
+	imageCmd.AddCommand(imageImportCmd, pullCacheCmd)
 	rootCmd.AddCommand(imageCmd)
 }
