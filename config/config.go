@@ -70,6 +70,14 @@ type FileConfig struct {
 		// ports are routed by their SNI to the real host (e.g. almplus
 		// on 13001).
 		Ports []int `yaml:"ports"`
+		// Static TCP forwards ("PORT:HOST:PORT"): connections to the
+		// gateway port are spliced to the target through the host network,
+		// without TLS/SNI parsing. For non-TLS protocols like HTTP CONNECT
+		// proxies (e.g. "9480:gateway.zscloud.net:9480" lets pods use the
+		// Zscaler proxy of a CI config; the host's Zscaler client carries
+		// it). The target host also needs an entry in domains so pods
+		// resolve it to the gateway.
+		Forwards []string `yaml:"forwards"`
 	} `yaml:"egress"`
 	// Verbatim k3s registries.yaml content (mirrors, auth, TLS).
 	Registries string `yaml:"registries"`
@@ -114,7 +122,8 @@ type Config struct {
 
 	CACertGlobs    []string
 	EgressDomains  []string
-	EgressPorts    []int // extra SNI gateway ports (443 always served)
+	EgressPorts    []int     // extra SNI gateway ports (443 always served)
+	EgressForwards []Forward // static TCP forwards (no SNI parsing)
 	IngressDomains []string
 	Registries     string
 
@@ -204,6 +213,7 @@ func merge(dst *FileConfig, src FileConfig) {
 	if len(src.Egress.Ports) > 0 {
 		dst.Egress.Ports = src.Egress.Ports
 	}
+	l(&dst.Egress.Forwards, src.Egress.Forwards)
 	l(&dst.Egress.IngressDomains, src.Egress.IngressDomains)
 	s(&dst.Registries, src.Registries)
 }
@@ -233,6 +243,26 @@ func UserConfigDir() string {
 
 // Resolve layers the config files and applies built-in defaults.
 // projectPath comes from --config / K3C_CONFIG, defaulting to ./k3c.yaml.
+// Forward is a static TCP forward served by the egress gateway: traffic to
+// the gateway port is spliced to the target through the host network.
+type Forward struct {
+	Port   string // gateway listen port
+	Target string // host:port dialed on the host side
+}
+
+// parseForwards parses "PORT:HOST:PORT" forward declarations.
+func parseForwards(specs []string) ([]Forward, error) {
+	var forwards []Forward
+	for _, spec := range specs {
+		port, target, ok := strings.Cut(spec, ":")
+		if _, err := strconv.Atoi(port); !ok || err != nil || !strings.Contains(target, ":") {
+			return nil, fmt.Errorf("invalid egress forward %q (want PORT:HOST:PORT)", spec)
+		}
+		forwards = append(forwards, Forward{Port: port, Target: target})
+	}
+	return forwards, nil
+}
+
 func Resolve(cluster, projectPath string) (*Config, error) {
 	var fc FileConfig
 
@@ -312,6 +342,10 @@ func Resolve(cluster, projectPath string) (*Config, error) {
 	}
 
 	contextPrefix := def(fc.Cluster.ContextPrefix, "k3c-")
+	forwards, err := parseForwards(fc.Egress.Forwards)
+	if err != nil {
+		return nil, err
+	}
 	return &Config{
 		Cluster:              cluster,
 		ServerName:           cluster + "-server",
@@ -335,6 +369,7 @@ func Resolve(cluster, projectPath string) (*Config, error) {
 		CACertGlobs:          fc.CACerts,
 		EgressDomains:        fc.Egress.Domains,
 		EgressPorts:          fc.Egress.Ports,
+		EgressForwards:       forwards,
 		IngressDomains:       fc.Egress.IngressDomains,
 		Registries:           fc.Registries,
 		ContainerBinary:      def(fc.ContainerBinary, "container"),

@@ -235,6 +235,21 @@ func handleEgressPortConn(conn net.Conn, port string) {
 	splice(conn, upstream)
 }
 
+// handleForwardConn serves a static egress forward: every connection is
+// spliced to the fixed target through the host network — no TLS parsing,
+// so non-TLS protocols work (e.g. HTTP CONNECT to a corporate proxy).
+func handleForwardConn(conn net.Conn, target string) {
+	defer conn.Close()
+	if !allowedSource(conn.RemoteAddr()) {
+		return
+	}
+	upstream, err := net.DialTimeout("tcp", target, connectTimeout)
+	if err != nil {
+		return
+	}
+	splice(conn, upstream)
+}
+
 // --- daemon lifecycle ---
 
 func serve(addr string, handler func(net.Conn)) error {
@@ -282,6 +297,12 @@ func RunDaemons(cfg *config.Config) error {
 			errCh <- serve("0.0.0.0:"+port, func(c net.Conn) { handleEgressPortConn(c, port) })
 		}()
 	}
+	for _, f := range cfg.EgressForwards {
+		fw := f
+		go func() {
+			errCh <- serve("0.0.0.0:"+fw.Port, func(c net.Conn) { handleForwardConn(c, fw.Target) })
+		}()
+	}
 	if len(ignoredResources(cfg)) > 0 {
 		go func() { errCh <- serveWebhook(cfg) }()
 	}
@@ -291,11 +312,16 @@ func RunDaemons(cfg *config.Config) error {
 	return <-errCh
 }
 
-// egressPortMissing reports whether a configured egress gateway port is
-// not served by the running daemons.
+// egressPortMissing reports whether a configured egress gateway port or
+// forward is not served by the running daemons.
 func egressPortMissing(cfg *config.Config) bool {
 	for _, p := range cfg.EgressPorts {
 		if p != 443 && !portOpen(strconv.Itoa(p)) {
+			return true
+		}
+	}
+	for _, f := range cfg.EgressForwards {
+		if !portOpen(f.Port) {
 			return true
 		}
 	}

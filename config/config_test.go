@@ -96,3 +96,15 @@ func TestCorednsCustomCatchAll(t *testing.T) {
 		t.Errorf("domain-list manifest must not contain the catch-all guard:\n%s", manifest)
 	}
 }
+
+func TestParseForwards(t *testing.T) {
+	fwds, err := parseForwards([]string{"9480:gateway.zscloud.net:9480"})
+	if err != nil || len(fwds) != 1 || fwds[0].Port != "9480" || fwds[0].Target != "gateway.zscloud.net:9480" {
+		t.Fatalf("unexpected result: %v, %v", fwds, err)
+	}
+	for _, bad := range []string{"9480", "x:host:1", "9480:hostonly"} {
+		if _, err := parseForwards([]string{bad}); err == nil {
+			t.Errorf("%q: expected error", bad)
+		}
+	}
+}

@@ -181,6 +181,9 @@ egress:
   domains: [example.com]       # pod HTTPS egress via the SNI gateway
                                # ["*"] allows every external domain at once
   ingressDomains: [example.test] # ...except these: routed to the ingress
+  # static TCP forwards for non-TLS protocols (no SNI parsing), e.g. an
+  # HTTP CONNECT proxy; the target host also belongs in domains above
+  # forwards: ["9480:gateway.zscloud.net:9480"]
 
 registries: |                  # verbatim k3s registries.yaml
   mirrors:
