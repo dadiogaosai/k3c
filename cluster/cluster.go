@@ -498,6 +498,9 @@ func Start(cfg *config.Config) error {
 			if out, err := runContainer("start", cfg.ServerName); err != nil {
 				return fmt.Errorf("restart failed: %s", out)
 			}
+			// the restart spawned a new VM process; without re-clamping it
+			// runs the k3s boot storm at full priority
+			applyCPUPriority(cfg)
 			continue
 		}
 		return err
