@@ -242,6 +242,9 @@ func (d *doctor) checkDaemons(cfg *config.Config) {
 	if cfg.RegistryEnabled {
 		listeners = append(listeners, listener{"registry", cfg.RegistryPort})
 	}
+	if cfg.PullCacheEnabled {
+		listeners = append(listeners, listener{"pull-cache", cfg.PullCachePort})
+	}
 	down := []string{}
 	for _, l := range listeners {
 		if !portOpen(l.port) {

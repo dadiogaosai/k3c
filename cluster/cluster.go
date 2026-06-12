@@ -150,8 +150,8 @@ func prepareNodeConfig(cfg *config.Config) error {
 		return err
 	}
 	_ = os.Remove(filepath.Join(etc, "k3s.yaml"))
-	if cfg.Registries != "" {
-		if err := os.WriteFile(filepath.Join(etc, "registries.yaml"), []byte(cfg.Registries), 0o644); err != nil {
+	if registries := cfg.EffectiveRegistries(); registries != "" {
+		if err := os.WriteFile(filepath.Join(etc, "registries.yaml"), []byte(registries), 0o644); err != nil {
 			return err
 		}
 	}

@@ -280,8 +280,9 @@ func daemonsVersionFile(cfg *config.Config) string {
 // respawns them.
 func daemonsVersion(cfg *config.Config) string {
 	v := version.Get()
-	return fmt.Sprintf("%s %s %s ports=%v forwards=%v",
-		v.Version, v.GitCommit, v.BuildDate, cfg.EgressPorts, cfg.EgressForwards)
+	return fmt.Sprintf("%s %s %s ports=%v forwards=%v pullcache=%v:%s",
+		v.Version, v.GitCommit, v.BuildDate, cfg.EgressPorts, cfg.EgressForwards,
+		cfg.PullCacheEnabled, cfg.PullCachePort)
 }
 
 func RunDaemons(cfg *config.Config) error {
@@ -306,6 +307,9 @@ func RunDaemons(cfg *config.Config) error {
 		go func() {
 			errCh <- serve("0.0.0.0:"+fw.Port, func(c net.Conn) { handleForwardConn(c, fw.Target) })
 		}()
+	}
+	if cfg.PullCacheEnabled {
+		go func() { errCh <- servePullCache(cfg) }()
 	}
 	if len(ignoredResources(cfg)) > 0 {
 		go func() { errCh <- serveWebhook(cfg) }()
@@ -394,6 +398,9 @@ func DaemonsStatus(cfg *config.Config) error {
 	}
 	if cfg.RegistryEnabled {
 		listener("registry", cfg.RegistryPort, "")
+	}
+	if cfg.PullCacheEnabled {
+		listener("pull-cache", cfg.PullCachePort, "")
 	}
 	return nil
 }

@@ -1,0 +1,391 @@
+package cluster
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/philipparndt/go-logger"
+
+	"k3c/config"
+)
+
+// The pull-through cache makes image pulls transparent and shared across
+// clusters: the generated registries.yaml lists the cache as the first
+// mirror endpoint for every configured registry (the real upstream stays
+// second, so containerd falls back if the cache is down). containerd
+// appends ?ns=<registry> when querying a mirror, so one listener serves
+// all upstreams. Blobs are content-addressed and cached forever in one
+// global store; manifests by tag are revalidated upstream and served
+// stale when the upstream is unreachable.
+
+const pullCacheBlobLimit = 16 << 30 // sanity cap per blob
+
+func pullCacheDir(cfg *config.Config) string {
+	return filepath.Join(cfg.BaseDir, "pull-cache")
+}
+
+type pullCache struct {
+	cfg       *config.Config
+	upstreams map[string][]string // registry host -> upstream endpoints
+	client    *http.Client
+
+	tokenMu sync.Mutex
+	tokens  map[string]tokenEntry
+
+	lockMu sync.Mutex
+	locks  map[string]*sync.Mutex
+}
+
+type tokenEntry struct {
+	token   string
+	expires time.Time
+}
+
+func newPullCache(cfg *config.Config) *pullCache {
+	return &pullCache{
+		cfg:       cfg,
+		upstreams: config.RegistryUpstreams(cfg.Registries),
+		client:    &http.Client{Timeout: 30 * time.Minute},
+		tokens:    map[string]tokenEntry{},
+		locks:     map[string]*sync.Mutex{},
+	}
+}
+
+// servePullCache runs the registry pull-through cache listener.
+func servePullCache(cfg *config.Config) error {
+	p := newPullCache(cfg)
+	for _, dir := range []string{"blobs", "types", "tags"} {
+		if err := os.MkdirAll(filepath.Join(pullCacheDir(cfg), dir), 0o755); err != nil {
+			return err
+		}
+	}
+	logger.Info("listening on 0.0.0.0:" + cfg.PullCachePort + " (pull-through cache)")
+	server := &http.Server{
+		Addr:              "0.0.0.0:" + cfg.PullCachePort,
+		Handler:           p,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	return server.ListenAndServe()
+}
+
+var pullPathRe = regexp.MustCompile(`^/v2/(.+)/(manifests|blobs)/([^/]+)$`)
+
+func (p *pullCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v2/" || r.URL.Path == "/v2" {
+		w.WriteHeader(http.StatusOK) // the cache itself needs no auth
+		return
+	}
+	m := pullPathRe.FindStringSubmatch(r.URL.Path)
+	ns := r.URL.Query().Get("ns")
+	if m == nil || ns == "" || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+		http.Error(w, "unsupported request", http.StatusBadRequest)
+		return
+	}
+	name, kind, ref := m[1], m[2], m[3]
+	switch {
+	case kind == "blobs":
+		p.serveBlob(w, r, ns, name, ref)
+	case strings.HasPrefix(ref, "sha256:"):
+		p.serveManifestByDigest(w, r, ns, name, ref)
+	default:
+		p.serveManifestByTag(w, r, ns, name, ref)
+	}
+}
+
+func (p *pullCache) blobPath(digest string) string {
+	return filepath.Join(pullCacheDir(p.cfg), "blobs", digest)
+}
+
+func (p *pullCache) typePath(digest string) string {
+	return filepath.Join(pullCacheDir(p.cfg), "types", digest)
+}
+
+func (p *pullCache) tagPath(ns, name, tag string) string {
+	return filepath.Join(pullCacheDir(p.cfg), "tags", ns, name, tag)
+}
+
+// digestLock serializes concurrent downloads of the same content.
+func (p *pullCache) digestLock(digest string) *sync.Mutex {
+	p.lockMu.Lock()
+	defer p.lockMu.Unlock()
+	if l, ok := p.locks[digest]; ok {
+		return l
+	}
+	l := &sync.Mutex{}
+	p.locks[digest] = l
+	return l
+}
+
+func (p *pullCache) serveBlob(w http.ResponseWriter, r *http.Request, ns, name, digest string) {
+	if !strings.HasPrefix(digest, "sha256:") {
+		http.Error(w, "unsupported digest", http.StatusBadRequest)
+		return
+	}
+	if _, err := os.Stat(p.blobPath(digest)); err != nil {
+		lock := p.digestLock(digest)
+		lock.Lock()
+		_, err = os.Stat(p.blobPath(digest))
+		if err != nil {
+			err = p.fetchContent(ns, name, "blobs", digest, digest, "")
+		}
+		lock.Unlock()
+		if err != nil {
+			logger.Warn("pull cache: blob " + digest + " from " + ns + "/" + name + ": " + err.Error())
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+	}
+	w.Header().Set("Docker-Content-Digest", digest)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	http.ServeFile(w, r, p.blobPath(digest))
+}
+
+func (p *pullCache) serveManifestByDigest(w http.ResponseWriter, r *http.Request, ns, name, digest string) {
+	if _, err := os.Stat(p.blobPath(digest)); err != nil {
+		lock := p.digestLock(digest)
+		lock.Lock()
+		_, err = os.Stat(p.blobPath(digest))
+		if err != nil {
+			err = p.fetchContent(ns, name, "manifests", digest, digest, r.Header.Get("Accept"))
+		}
+		lock.Unlock()
+		if err != nil {
+			logger.Warn("pull cache: manifest " + digest + " from " + ns + "/" + name + ": " + err.Error())
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+	}
+	p.writeManifest(w, r, digest)
+}
+
+func (p *pullCache) serveManifestByTag(w http.ResponseWriter, r *http.Request, ns, name, tag string) {
+	digest, err := p.resolveTag(ns, name, tag, r.Header.Get("Accept"))
+	if err != nil {
+		// upstream unreachable: serve the last known digest if we have one
+		if cached, readErr := os.ReadFile(p.tagPath(ns, name, tag)); readErr == nil {
+			logger.Warn("pull cache: upstream for " + ns + "/" + name + ":" + tag + " unreachable, serving cached manifest")
+			p.writeManifest(w, r, strings.TrimSpace(string(cached)))
+			return
+		}
+		logger.Warn("pull cache: tag " + ns + "/" + name + ":" + tag + ": " + err.Error())
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	p.writeManifest(w, r, digest)
+}
+
+func (p *pullCache) writeManifest(w http.ResponseWriter, r *http.Request, digest string) {
+	data, err := os.ReadFile(p.blobPath(digest))
+	if err != nil {
+		http.Error(w, "manifest content missing", http.StatusBadGateway)
+		return
+	}
+	contentType := "application/vnd.oci.image.manifest.v1+json"
+	if t, err := os.ReadFile(p.typePath(digest)); err == nil {
+		contentType = strings.TrimSpace(string(t))
+	}
+	w.Header().Set("Docker-Content-Digest", digest)
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write(data)
+}
+
+// resolveTag fetches the manifest for a tag from the upstream, caches the
+// content by digest, records the tag mapping, and returns the digest.
+func (p *pullCache) resolveTag(ns, name, tag, accept string) (string, error) {
+	resp, err := p.upstreamRequest(http.MethodGet, ns, name, "manifests", tag, accept)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(body)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	if hdr := resp.Header.Get("Docker-Content-Digest"); hdr != "" && hdr != digest {
+		return "", fmt.Errorf("manifest digest mismatch for %s/%s:%s", ns, name, tag)
+	}
+	if err := os.WriteFile(p.blobPath(digest), body, 0o644); err != nil {
+		return "", err
+	}
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		_ = os.WriteFile(p.typePath(digest), []byte(contentType), 0o644)
+	}
+	if err := os.MkdirAll(filepath.Dir(p.tagPath(ns, name, tag)), 0o755); err != nil {
+		return "", err
+	}
+	_ = os.WriteFile(p.tagPath(ns, name, tag), []byte(digest), 0o644)
+	return digest, nil
+}
+
+// fetchContent downloads one content item into the cache, verifying its
+// digest while streaming.
+func (p *pullCache) fetchContent(ns, name, kind, ref, digest, accept string) error {
+	resp, err := p.upstreamRequest(http.MethodGet, ns, name, kind, ref, accept)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	tmp, err := os.CreateTemp(filepath.Join(pullCacheDir(p.cfg), "blobs"), ".download-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	hasher := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(resp.Body, pullCacheBlobLimit)); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if got := "sha256:" + hex.EncodeToString(hasher.Sum(nil)); got != digest {
+		return fmt.Errorf("digest mismatch: want %s, got %s", digest, got)
+	}
+	if kind == "manifests" {
+		if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+			_ = os.WriteFile(p.typePath(digest), []byte(contentType), 0o644)
+		}
+	}
+	return os.Rename(tmp.Name(), p.blobPath(digest))
+}
+
+// upstreamRequest performs a registry request against the first working
+// upstream endpoint for the namespace, handling the bearer token dance.
+func (p *pullCache) upstreamRequest(method, ns, name, kind, ref, accept string) (*http.Response, error) {
+	endpoints := p.upstreams[ns]
+	if len(endpoints) == 0 {
+		endpoints = []string{"https://" + ns}
+	}
+	var lastErr error
+	for _, endpoint := range endpoints {
+		resp, err := p.endpointRequest(method, endpoint, name, kind, ref, accept)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (p *pullCache) endpointRequest(method, endpoint, name, kind, ref, accept string) (*http.Response, error) {
+	reqURL := strings.TrimSuffix(endpoint, "/") + "/v2/" + name + "/" + kind + "/" + ref
+	do := func(token string) (*http.Response, error) {
+		req, err := http.NewRequest(method, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		return p.client.Do(req)
+	}
+
+	resp, err := do(p.cachedToken(endpoint, name))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		challenge := resp.Header.Get("Www-Authenticate")
+		_ = resp.Body.Close()
+		token, err := p.fetchToken(endpoint, name, challenge)
+		if err != nil {
+			return nil, err
+		}
+		if resp, err = do(token); err != nil {
+			return nil, err
+		}
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		return nil, fmt.Errorf("%s: HTTP %d", reqURL, resp.StatusCode)
+	}
+	return resp, nil
+}
+
+var challengeParamRe = regexp.MustCompile(`(\w+)="([^"]*)"`)
+
+func (p *pullCache) tokenKey(endpoint, name string) string { return endpoint + "|" + name }
+
+func (p *pullCache) cachedToken(endpoint, name string) string {
+	p.tokenMu.Lock()
+	defer p.tokenMu.Unlock()
+	if entry, ok := p.tokens[p.tokenKey(endpoint, name)]; ok && time.Now().Before(entry.expires) {
+		return entry.token
+	}
+	return ""
+}
+
+// fetchToken implements the anonymous bearer token flow of the registry
+// HTTP API ("Www-Authenticate: Bearer realm=..,service=..,scope=..").
+func (p *pullCache) fetchToken(endpoint, name, challenge string) (string, error) {
+	if !strings.HasPrefix(strings.ToLower(challenge), "bearer ") {
+		return "", fmt.Errorf("unsupported auth challenge %q", challenge)
+	}
+	params := map[string]string{}
+	for _, m := range challengeParamRe.FindAllStringSubmatch(challenge, -1) {
+		params[m[1]] = m[2]
+	}
+	realm := params["realm"]
+	if realm == "" {
+		return "", fmt.Errorf("auth challenge without realm: %q", challenge)
+	}
+	query := url.Values{}
+	if params["service"] != "" {
+		query.Set("service", params["service"])
+	}
+	scope := params["scope"]
+	if scope == "" {
+		scope = "repository:" + name + ":pull"
+	}
+	query.Set("scope", scope)
+
+	resp, err := p.client.Get(realm + "?" + query.Encode())
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var payload struct {
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("token response: %w", err)
+	}
+	token := payload.Token
+	if token == "" {
+		token = payload.AccessToken
+	}
+	if token == "" {
+		return "", fmt.Errorf("token endpoint %s returned no token", realm)
+	}
+	ttl := payload.ExpiresIn
+	if ttl < 60 {
+		ttl = 60
+	}
+	p.tokenMu.Lock()
+	p.tokens[p.tokenKey(endpoint, name)] = tokenEntry{token: token, expires: time.Now().Add(time.Duration(ttl-30) * time.Second)}
+	p.tokenMu.Unlock()
+	return token, nil
+}

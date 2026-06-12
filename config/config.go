@@ -79,6 +79,14 @@ type FileConfig struct {
 		// resolve it to the gateway.
 		Forwards []string `yaml:"forwards"`
 	} `yaml:"egress"`
+	// Pull-through cache: a host-side registry cache serving as first
+	// mirror endpoint for every configured registry. Transparent for the
+	// cluster, shared across all clusters, falls back to the real
+	// upstreams when down. Takes effect on cluster create.
+	PullCache struct {
+		Enabled *bool `yaml:"enabled"`
+		Port    int   `yaml:"port"` // default 5011
+	} `yaml:"pullCache"`
 	// Verbatim k3s registries.yaml content (mirrors, auth, TLS).
 	Registries string `yaml:"registries"`
 	// Path to the Apple `container` CLI (default: container from PATH).
@@ -130,6 +138,9 @@ type Config struct {
 	ContainerBinary string // the Apple container CLI to use
 	AutoReclaim     string // auto-reclaim interval ("off" disables)
 	CPUPriority     string // "low" (default) or "normal"
+
+	PullCacheEnabled bool
+	PullCachePort    string
 
 	BaseDir    string // state directory (~/.config/k3c)
 	ConfigFile string // project config in effect, for daemon respawn
@@ -214,6 +225,10 @@ func merge(dst *FileConfig, src FileConfig) {
 		dst.Egress.Ports = src.Egress.Ports
 	}
 	l(&dst.Egress.Forwards, src.Egress.Forwards)
+	if src.PullCache.Enabled != nil {
+		dst.PullCache.Enabled = src.PullCache.Enabled
+	}
+	i(&dst.PullCache.Port, src.PullCache.Port)
 	l(&dst.Egress.IngressDomains, src.Egress.IngressDomains)
 	s(&dst.Registries, src.Registries)
 }
@@ -371,6 +386,8 @@ func Resolve(cluster, projectPath string) (*Config, error) {
 		EgressPorts:          fc.Egress.Ports,
 		EgressForwards:       forwards,
 		IngressDomains:       fc.Egress.IngressDomains,
+		PullCacheEnabled:     fc.PullCache.Enabled != nil && *fc.PullCache.Enabled,
+		PullCachePort:        port(fc.PullCache.Port, 5011),
 		Registries:           fc.Registries,
 		ContainerBinary:      def(fc.ContainerBinary, "container"),
 		AutoReclaim:          def(fc.Cluster.AutoReclaim, "10m"),
@@ -481,6 +498,80 @@ data:
         rcode NOERROR
     }
 `, zones, c.VmnetGateway)
+}
+
+// k3sRegistries is the subset of the k3s registries.yaml schema needed
+// for the pull-through cache rewrite.
+type k3sRegistries struct {
+	Mirrors map[string]struct {
+		Endpoint []string `yaml:"endpoint"`
+	} `yaml:"mirrors"`
+	Configs map[string]any `yaml:"configs"`
+}
+
+// RegistryUpstreams maps every configured registry host to its upstream
+// endpoints (mirrors as configured; configs-only hosts to themselves).
+func RegistryUpstreams(registries string) map[string][]string {
+	var parsed k3sRegistries
+	_ = yaml.Unmarshal([]byte(registries), &parsed)
+	upstreams := map[string][]string{}
+	for host, mirror := range parsed.Mirrors {
+		if len(mirror.Endpoint) > 0 {
+			upstreams[host] = mirror.Endpoint
+		}
+	}
+	for host := range parsed.Configs {
+		if _, ok := upstreams[host]; !ok {
+			upstreams[host] = []string{"https://" + host}
+		}
+	}
+	return upstreams
+}
+
+// EffectiveRegistries returns the registries.yaml content written to the
+// node. With the pull cache enabled, every registry gets the cache as its
+// first mirror endpoint and its real upstreams as fallback; local
+// endpoints (the dev registry on the vmnet gateway) stay untouched.
+func (c *Config) EffectiveRegistries() string {
+	if !c.PullCacheEnabled || c.Registries == "" {
+		return c.Registries
+	}
+	var parsed k3sRegistries
+	if err := yaml.Unmarshal([]byte(c.Registries), &parsed); err != nil {
+		return c.Registries
+	}
+	cacheEndpoint := "http://" + c.VmnetGateway + ":" + c.PullCachePort
+	mirrors := map[string]map[string][]string{}
+	addMirror := func(host string, upstream []string) {
+		local := false
+		for _, e := range upstream {
+			if strings.Contains(e, c.VmnetGateway) || strings.Contains(e, "127.0.0.1") {
+				local = true
+			}
+		}
+		if local {
+			mirrors[host] = map[string][]string{"endpoint": upstream}
+			return
+		}
+		mirrors[host] = map[string][]string{"endpoint": append([]string{cacheEndpoint}, upstream...)}
+	}
+	for host, mirror := range parsed.Mirrors {
+		addMirror(host, mirror.Endpoint)
+	}
+	for host := range parsed.Configs {
+		if _, ok := mirrors[host]; !ok {
+			addMirror(host, []string{"https://" + host})
+		}
+	}
+	rewritten := map[string]any{"mirrors": mirrors}
+	if len(parsed.Configs) > 0 {
+		rewritten["configs"] = parsed.Configs
+	}
+	data, err := yaml.Marshal(rewritten)
+	if err != nil {
+		return c.Registries
+	}
+	return string(data)
 }
 
 // NoProxy lists destinations containerd must reach directly.

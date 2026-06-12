@@ -174,6 +174,10 @@ localRegistry:                 # registry:2 container for local pushes
   enabled: true
   hostPort: 5001
 
+pullCache:                     # host-side pull-through cache: transparent,
+  enabled: true                # shared across clusters, real upstreams stay
+                               # as fallback endpoints (applies on create)
+
 caCerts:                       # added to the node's registry CA bundle
   - certs/*.crt                # relative to this file
 

@@ -108,3 +108,46 @@ func TestParseForwards(t *testing.T) {
 		}
 	}
 }
+
+func TestEffectiveRegistries(t *testing.T) {
+	cfg := &Config{
+		VmnetGateway:     "192.168.64.1",
+		PullCachePort:    "5011",
+		PullCacheEnabled: true,
+		Registries: `mirrors:
+  "docker.io":
+    endpoint:
+      - https://dockerhub-remote.example.com
+  "registry.local:5001":
+    endpoint:
+      - http://192.168.64.1:5001
+configs:
+  "private-reg.example.com":
+    tls:
+      ca_file: /etc/rancher/k3s/ca-bundle.pem
+`,
+	}
+	out := cfg.EffectiveRegistries()
+	for _, want := range []string{
+		"http://192.168.64.1:5011", // the cache endpoint
+		"https://dockerhub-remote.example.com", // original upstream as fallback
+		"https://private-reg.example.com",         // configs-only host gets a mirror
+		"ca_file: /etc/rancher/k3s/ca-bundle.pem", // configs preserved
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rewritten registries missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Count(out, "192.168.64.1:5011") != 2 {
+		t.Errorf("cache endpoint should front exactly docker.io and the private registry:\n%s", out)
+	}
+	ups := RegistryUpstreams(cfg.Registries)
+	if got := ups["docker.io"][0]; got != "https://dockerhub-remote.example.com" {
+		t.Errorf("upstream mapping wrong: %v", ups)
+	}
+
+	cfg.PullCacheEnabled = false
+	if cfg.EffectiveRegistries() != cfg.Registries {
+		t.Error("disabled pull cache must keep registries verbatim")
+	}
+}
