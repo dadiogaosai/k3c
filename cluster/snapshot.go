@@ -331,6 +331,13 @@ func SnapshotRestore(cfg *config.Config, name string, cold bool) error {
 	if err := Start(cfg); err != nil {
 		return err
 	}
+	// the restored cluster may have different credentials than the one the
+	// kubeconfig was merged from (e.g. an imported snapshot): re-merge
+	if !warm {
+		if err := KubeconfigMerge(cfg); err != nil {
+			return err
+		}
+	}
 	// the restore rolled resourceVersions backward; watches resumed from a
 	// now-future version hang silently instead of erroring
 	logger.Info("note: watch-based clients (k9s, kubectl -w) keep stale caches after a restore; restart them")

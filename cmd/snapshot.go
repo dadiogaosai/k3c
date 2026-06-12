@@ -20,6 +20,7 @@ func snapshotArgs(args []string) (clusterArgs []string, snapshot string) {
 var (
 	snapshotSaveCold    bool
 	snapshotRestoreCold bool
+	snapshotExportOut   string
 )
 
 // newSnapshotCmd builds the snapshot command tree. It is registered both
@@ -90,7 +91,36 @@ func newSnapshotCmd() *cobra.Command {
 		},
 	}
 
-	snapshotCmd.AddCommand(saveCmd, restoreCmd, listCmd, deleteCmd)
+	exportCmd := &cobra.Command{
+		Use:   "export [CLUSTER] NAME",
+		Short: "Export a snapshot to a portable archive (always restores cold)",
+		Args:  cobra.RangeArgs(1, 2),
+		Run: func(cmd *cobra.Command, args []string) {
+			if len(args) == 1 {
+				fail(cluster.SnapshotExport(loadConfigDefault(nil), args[0], snapshotExportOut))
+				return
+			}
+			clusterArgs, name := snapshotArgs(args)
+			fail(cluster.SnapshotExport(loadConfigDefault(clusterArgs), name, snapshotExportOut))
+		},
+	}
+	exportCmd.Flags().StringVarP(&snapshotExportOut, "output", "o", "",
+		"output file (default <cluster>-<name>.k3csnap)")
+
+	importCmd := &cobra.Command{
+		Use:   "import FILE [NAME]",
+		Short: "Import an exported snapshot archive (create the cluster first)",
+		Args:  cobra.RangeArgs(1, 2),
+		Run: func(cmd *cobra.Command, args []string) {
+			name := ""
+			if len(args) > 1 {
+				name = args[1]
+			}
+			fail(cluster.SnapshotImport(loadConfigDefault(nil), args[0], name))
+		},
+	}
+
+	snapshotCmd.AddCommand(saveCmd, restoreCmd, listCmd, deleteCmd, exportCmd, importCmd)
 	return snapshotCmd
 }
 
