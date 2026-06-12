@@ -347,7 +347,9 @@ func firstLine(s string) string {
 // perspective. There is no official image with a comparable toolset;
 // the image is overridable for environments that require a blessed one.
 const debugPodName = "k3c-debug"
-const defaultDebugImage = "docker.io/nicolaka/netshoot:latest"
+
+// netshoot v0.14, pinned by digest for reproducibility (--image overrides)
+const defaultDebugImage = "docker.io/nicolaka/netshoot@sha256:47b907d662d139d1e2f22bfe14f4efca1e3f1feed283572f47c970c780c03b61"
 
 func debugPodManifest(image string) string {
 	return `apiVersion: v1

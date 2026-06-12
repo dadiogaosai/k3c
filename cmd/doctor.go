@@ -40,6 +40,6 @@ func init() {
 	doctorCmd.Flags().BoolVar(&doctorShellRm, "rm", false,
 		"remove the debug pod (with --shell: when the shell exits)")
 	doctorCmd.Flags().StringVar(&doctorShellImage, "image", "",
-		"debug pod image (default docker.io/nicolaka/netshoot:latest)")
+		"debug pod image (default nicolaka/netshoot, digest-pinned)")
 	rootCmd.AddCommand(doctorCmd)
 }
