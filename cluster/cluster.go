@@ -414,6 +414,7 @@ func Create(cfg *config.Config) error {
 	if err := waitReady(cfg); err != nil {
 		return err
 	}
+	applyControlPlaneWeight(cfg)
 	// register the webhook before the coredns setup: a failed rollout must
 	// not leave a cluster that silently admits pods with full requests
 	if err := applyIgnoreCPUWebhook(cfg); err != nil {
@@ -532,6 +533,7 @@ func postStart(cfg *config.Config) error {
 	if err := waitReady(cfg); err != nil {
 		return err
 	}
+	applyControlPlaneWeight(cfg)
 	// webhook first: a failed coredns rollout must not leave a cluster
 	// that silently admits pods with full requests
 	if err := applyIgnoreCPUWebhook(cfg); err != nil {
@@ -539,6 +541,21 @@ func postStart(cfg *config.Config) error {
 	}
 	// re-apply so egress config changes take effect on a restart
 	return setupCoreDNS(cfg)
+}
+
+// applyControlPlaneWeight raises the k3s cgroup's CPU weight inside the
+// guest. The admission webhook strips pod CPU requests, so all pods get
+// equal tiny weights — but the whole control plane (one k3s process:
+// apiserver, datastore, scheduler) competes as a SIBLING cgroup at weight
+// 100 against kubepods' 430 and starves during pod startup storms: the
+// API stops answering and installs fail with handshake timeouts. Weight
+// 1000 makes the control plane win contention; weights have no effect
+// without contention.
+func applyControlPlaneWeight(cfg *config.Config) {
+	if out, err := runContainer("exec", cfg.ServerName,
+		"sh", "-c", "echo 1000 > /sys/fs/cgroup/k3s/cpu.weight"); err != nil {
+		logger.Debug("control plane cpu weight: " + strings.TrimSpace(out))
+	}
 }
 
 // clusterStates maps cluster names to their server/registry container
