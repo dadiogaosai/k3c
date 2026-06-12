@@ -4,12 +4,17 @@
 package main
 
 import (
-	"k3c/cmd"
+	"os"
 
 	"github.com/philipparndt/go-logger"
+
+	"k3c/cmd"
 )
 
 func main() {
 	logger.Init("debug", logger.CLICompact())
+	// keep stdout clean for command output (tables, JSON, kubeconfigs);
+	// logs go to stderr like any well-behaved CLI
+	logger.LogTo(os.Stderr)
 	cmd.Execute()
 }
