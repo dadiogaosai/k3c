@@ -2,6 +2,7 @@
 package cluster
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -242,6 +243,8 @@ func kubeconfig(cfg *config.Config, wait bool) (string, error) {
 
 // KubeconfigGet prints the cluster's kubeconfig to stdout.
 func KubeconfigGet(cfg *config.Config) error {
+	// without the per-cluster ports the server URL gets an empty port
+	_ = loadPorts(cfg)
 	kc, err := kubeconfig(cfg, false)
 	if err != nil {
 		return err
@@ -253,6 +256,9 @@ func KubeconfigGet(cfg *config.Config) error {
 // KubeconfigMerge merges the cluster's kubeconfig into ~/.kube/config and
 // switches the current context.
 func KubeconfigMerge(cfg *config.Config) error {
+	// without the per-cluster ports the server URL gets an empty port,
+	// which is not even valid YAML
+	_ = loadPorts(cfg)
 	logger.Info("waiting for kubeconfig")
 	kc, err := kubeconfig(cfg, true)
 	if err != nil {
@@ -288,7 +294,12 @@ func KubeconfigMerge(cfg *config.Config) error {
 		merge.Env = append(os.Environ(), "KUBECONFIG="+tmp.Name()+":"+kubeConfig)
 		merged, err := merge.Output()
 		if err != nil {
-			return fmt.Errorf("kubeconfig merge failed: %w", err)
+			detail := ""
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				detail = ": " + strings.TrimSpace(string(exitErr.Stderr))
+			}
+			return fmt.Errorf("kubeconfig merge failed: %w%s", err, detail)
 		}
 		if err := os.WriteFile(kubeConfig, merged, 0o600); err != nil {
 			return err
