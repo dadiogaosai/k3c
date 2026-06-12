@@ -70,6 +70,20 @@ func ensureSystem() error {
 		}
 	}
 
+	// A `system start` that died half-way (e.g. on the kernel install
+	// prompt of older k3c builds) leaves the apiserver responding while its
+	// plugins were never registered: `system status` looks fine but every
+	// image operation fails with "Plugin ... not found". Detect exactly
+	// that state and restart the system services.
+	if out, err := Output("images", "ls"); err != nil &&
+		strings.Contains(out, "Plugin") && strings.Contains(out, "not found") {
+		logger.Info("container system is missing its plugins (an aborted first start); restarting it")
+		_, _ = Output("system", "stop")
+		if out, err := Output("system", "start", "--enable-kernel-install"); err != nil {
+			return fmt.Errorf("could not restart container system: %s", out)
+		}
+	}
+
 	if err := ensureInitImage(); err != nil {
 		return err
 	}
