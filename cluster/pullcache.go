@@ -376,6 +376,98 @@ func PullCacheInfo(cfg *config.Config) error {
 	return nil
 }
 
+// PullCachePrune removes images not pulled within maxAge: tag mappings
+// older than the cutoff (their files are rewritten on every revalidation,
+// so mtime is the last use) are dropped, content reachable from the
+// remaining tags is marked, and unmarked blobs older than the cutoff are
+// swept. Recent unmarked blobs stay — digest-pinned pulls have no tag
+// mapping anchoring them.
+func PullCachePrune(cfg *config.Config, maxAge time.Duration) error {
+	if maxAge < 24*time.Hour {
+		return fmt.Errorf("retention below one day would sweep the cache wholesale; use `pull-cache clear` for that")
+	}
+	cutoff := time.Now().Add(-maxAge)
+	marked := map[string]bool{}
+	prunedTags := 0
+	tagsBase := filepath.Join(pullCacheDir(cfg), "tags")
+	_ = filepath.WalkDir(tagsBase, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.ModTime().Before(cutoff) {
+			_ = os.Remove(path)
+			prunedTags++
+			return nil
+		}
+		if data, err := os.ReadFile(path); err == nil {
+			markCachedTree(cfg, strings.TrimSpace(string(data)), marked, 0)
+		}
+		return nil
+	})
+
+	removed := 0
+	var freed int64
+	entries, _ := os.ReadDir(filepath.Join(pullCacheDir(cfg), "blobs"))
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "sha256:") || marked[name] {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(pullCacheDir(cfg), "blobs", name)); err == nil {
+			_ = os.Remove(filepath.Join(pullCacheDir(cfg), "types", name))
+			removed++
+			freed += info.Size()
+		}
+	}
+	logger.Info(fmt.Sprintf("pruned %d stale tags and %d blobs (%.1f GB freed)",
+		prunedTags, removed, float64(freed)/1e9))
+	return nil
+}
+
+// markCachedTree marks a manifest and everything reachable from it
+// (child manifests, config, layers) as in use.
+func markCachedTree(cfg *config.Config, digest string, marked map[string]bool, depth int) {
+	if digest == "" || marked[digest] || depth > 3 {
+		return
+	}
+	marked[digest] = true
+	data, err := os.ReadFile(filepath.Join(pullCacheDir(cfg), "blobs", digest))
+	if err != nil {
+		return
+	}
+	var manifest struct {
+		Config struct {
+			Digest string `json:"digest"`
+		} `json:"config"`
+		Layers []struct {
+			Digest string `json:"digest"`
+		} `json:"layers"`
+		Manifests []struct {
+			Digest string `json:"digest"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return
+	}
+	if manifest.Config.Digest != "" {
+		marked[manifest.Config.Digest] = true
+	}
+	for _, layer := range manifest.Layers {
+		marked[layer.Digest] = true
+	}
+	for _, child := range manifest.Manifests {
+		markCachedTree(cfg, child.Digest, marked, depth+1)
+	}
+}
+
 // PullCacheClear empties the pull cache (the daemons recreate paths as
 // needed on the next download).
 func PullCacheClear(cfg *config.Config) error {

@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"time"
+
 	"github.com/spf13/cobra"
 
 	"k3c/cluster"
@@ -53,8 +55,21 @@ var pullCacheClearCmd = &cobra.Command{
 	},
 }
 
+var pullCachePruneDays int
+
+var pullCachePruneCmd = &cobra.Command{
+	Use:   "prune",
+	Short: "Remove images not pulled within the retention window",
+	Args:  cobra.NoArgs,
+	Run: func(cmd *cobra.Command, args []string) {
+		fail(cluster.PullCachePrune(loadConfigDefault(nil), time.Duration(pullCachePruneDays)*24*time.Hour))
+	},
+}
+
 func init() {
-	pullCacheCmd.AddCommand(pullCacheListCmd, pullCacheInfoCmd, pullCacheClearCmd)
+	pullCachePruneCmd.Flags().IntVar(&pullCachePruneDays, "days", 14,
+		"retention: keep images pulled within this many days")
+	pullCacheCmd.AddCommand(pullCacheListCmd, pullCacheInfoCmd, pullCacheClearCmd, pullCachePruneCmd)
 	imageCmd.AddCommand(imageImportCmd, pullCacheCmd)
 	rootCmd.AddCommand(imageCmd)
 }
