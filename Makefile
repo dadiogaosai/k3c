@@ -71,6 +71,8 @@ bundle: ## stage the container install tree into runtime/payload (STAGING_DIR=..
 			|| printf 'unknown\n' > $(PAYLOAD_VERSION); \
 	fi
 	@echo "container version: $$(cat $(PAYLOAD_VERSION))"
+	@echo "building gvnet transparent-egress netstack helper into the payload"
+	@go build -ldflags "-s -w" -o "$(STAGING_DIR)/bin/gvnet" ./cmd/gvnet
 	@if [ -f "$(INIT_TAR)" ]; then \
 		echo "including init image: $(INIT_TAR)"; \
 		if [ "$(INIT_TAR)" != "$(STAGING_DIR)/init.tar" ]; then \

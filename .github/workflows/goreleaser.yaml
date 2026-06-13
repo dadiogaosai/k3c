@@ -8,13 +8,13 @@ on:
       - "v*"
 
 env:
-  # Forks of apple/container with pause/resume + suspend-to-disk support.
-  # The container repo's Package.swift references ../containerization, so
-  # both are checked out as sibling directories.
+  # Forks of apple/container with pause/resume + suspend-to-disk + transparent
+  # egress (gvnet) support. The container repo's Package.swift references
+  # ../containerization, so both are checked out as sibling directories.
   CONTAINER_REPO: philipparndt/container
-  CONTAINER_REF: feat/suspend-to-disk
+  CONTAINER_REF: feat/gvnet-egress
   CONTAINERIZATION_REPO: philipparndt/containerization
-  CONTAINERIZATION_REF: feat/suspend-to-disk
+  CONTAINERIZATION_REF: feat/gvnet-egress
 
 jobs:
   goreleaser:
