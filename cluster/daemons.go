@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,29 +114,30 @@ func handleProxyConn(conn net.Conn) {
 		return
 	}
 	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
+	req, err := http.ReadRequest(reader)
 	if err != nil {
 		return
 	}
-	parts := strings.Fields(line)
-	if len(parts) < 2 || parts[0] != "CONNECT" {
-		fmt.Fprint(conn, "HTTP/1.1 501 Not Implemented\r\n\r\n")
+	if req.Method == http.MethodConnect {
+		handleConnect(conn, reader, req.Host)
 		return
 	}
-	// drain remaining request headers
-	for {
-		h, err := reader.ReadString('\n')
-		if err != nil || h == "\r\n" || h == "\n" {
-			break
-		}
-	}
-	upstream, err := net.DialTimeout("tcp", parts[1], connectTimeout)
+	// Plain-HTTP forward proxy (e.g. `GET http://pki1.../ca.pem`). The CONNECT
+	// tunnel only covers HTTPS; without this, plain http:// egress from the
+	// sidecar — like a Dockerfile `ADD http://...` — gets a 501. Forwarding it
+	// here makes the proxy a drop-in for a normal egress path (OrbStack parity).
+	handleForwardHTTP(conn, req)
+}
+
+// handleConnect tunnels raw bytes to target ("host:port") after the 200 reply,
+// handing over anything the client pipelined behind the CONNECT request.
+func handleConnect(conn net.Conn, reader *bufio.Reader, target string) {
+	upstream, err := net.DialTimeout("tcp", target, connectTimeout)
 	if err != nil {
 		fmt.Fprint(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		return
 	}
 	fmt.Fprint(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
-	// hand over any bytes the client pipelined behind the headers
 	if n := reader.Buffered(); n > 0 {
 		buffered, _ := reader.Peek(n)
 		if _, err := upstream.Write(buffered); err != nil {
@@ -144,6 +146,30 @@ func handleProxyConn(conn net.Conn) {
 		}
 	}
 	splice(conn, upstream)
+}
+
+// handleForwardHTTP performs a plain-HTTP proxy request: it dials the target
+// directly (the proxy daemon runs on the host, which has real egress) and
+// relays the response back to the sidecar.
+func handleForwardHTTP(conn net.Conn, req *http.Request) {
+	if req.URL == nil || !req.URL.IsAbs() {
+		fmt.Fprint(conn, "HTTP/1.1 400 Bad Request\r\n\r\n")
+		return
+	}
+	req.RequestURI = "" // must be cleared to use the request as a client request
+	req.Header.Del("Proxy-Connection")
+	transport := &http.Transport{
+		Proxy:                 nil, // we ARE the proxy; dial the target directly
+		DialContext:           (&net.Dialer{Timeout: connectTimeout}).DialContext,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		fmt.Fprint(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		return
+	}
+	defer resp.Body.Close()
+	_ = resp.Write(conn)
 }
 
 // --- SNI gateway ---
