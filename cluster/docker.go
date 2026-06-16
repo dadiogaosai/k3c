@@ -310,6 +310,31 @@ func vmnetCIDR(gateway string) string {
 	return gateway
 }
 
+// forwardRegistryLoopback makes 127.0.0.1:<RegistryPort> inside the sidecar
+// reach the cluster's local registry. The registry lives off-VM (reachable at
+// the vmnet gateway), but build tooling tags images localhost:<port> — the
+// same address the host and the k3s node resolve to the registry — so the
+// sidecar's engine must resolve it too, or `docker push localhost:<port>/…`
+// fails with "connection refused". Loopback isn't routed off-host by default,
+// so enable route_localnet and DNAT it to the gateway, MASQUERADE'ing the
+// source so replies find their way back. Best-effort and idempotent.
+func forwardRegistryLoopback(cfg *config.Config) {
+	if !cfg.RegistryEnabled || cfg.RegistryPort == "" {
+		return
+	}
+	p, gw := cfg.RegistryPort, cfg.VmnetGateway
+	script := strings.Join([]string{
+		"sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true",
+		fmt.Sprintf("iptables -t nat -C OUTPUT -p tcp -d 127.0.0.1 --dport %s -j DNAT --to-destination %s:%s 2>/dev/null || "+
+			"iptables -t nat -A OUTPUT -p tcp -d 127.0.0.1 --dport %s -j DNAT --to-destination %s:%s", p, gw, p, p, gw, p),
+		fmt.Sprintf("iptables -t nat -C POSTROUTING -p tcp -d %s --dport %s -j MASQUERADE 2>/dev/null || "+
+			"iptables -t nat -A POSTROUTING -p tcp -d %s --dport %s -j MASQUERADE", gw, p, gw, p),
+	}, "; ")
+	if out, err := runContainer("exec", dockerName, "sh", "-c", script); err != nil {
+		logger.Warn("registry loopback forward (push to localhost:" + p + " may fail): " + out)
+	}
+}
+
 // applyDockerSysctls raises the sidecar VM's kernel limits (the configured
 // node sysctls — notably the inotify instance/watch limits, whose defaults are
 // far too low for file-watching workloads) so nested k3d pods get the same
@@ -356,6 +381,10 @@ func dockerReady(cfg *config.Config) error {
 	// raise the sidecar VM kernel limits (notably inotify) so nested k3d pods
 	// don't hit the low defaults the native cluster also overrides
 	applyDockerSysctls(cfg)
+	// make localhost:<registry-port> reach the local registry from the sidecar,
+	// so `docker push localhost:<port>/…` (build tooling tags images this way,
+	// the same address the host and node resolve) works from the sidecar engine
+	forwardRegistryLoopback(cfg)
 	// bake the corporate CA into the configured k3s node images so nested
 	// `k3d cluster create` works unmodified (best-effort: the sidecar itself
 	// is usable for plain docker even if this fails)
