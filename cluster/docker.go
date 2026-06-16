@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -73,11 +74,8 @@ func DockerUp(cfg *config.Config, recreate bool) error {
 		return dockerAwait(cfg)
 	}
 
-	if out, err := runContainer("volume", "inspect", dockerVolume); err != nil {
-		logger.Info("creating docker image store volume (" + dockerVolume + ")")
-		if out, err = runContainer("volume", "create", dockerVolume); err != nil {
-			return fmt.Errorf("creating volume: %s", out)
-		}
+	if err := ensureDockerVolume(dockerVolume); err != nil {
+		return err
 	}
 
 	// the corporate TLS interception signs with the corporate CA: give
@@ -153,6 +151,60 @@ func DockerUp(cfg *config.Config, recreate bool) error {
 	}
 	applyCPUPriority(&config.Config{ServerName: dockerName, CPUPriority: cfg.CPUPriority})
 	return dockerAwait(cfg)
+}
+
+// ensureDockerVolume makes sure the sidecar's image-store volume exists AND is
+// usable. A plain "volume inspect || create" is not enough: if the volume's
+// backing image is removed out from under the runtime (e.g. a host disk
+// cleanup), the record survives as a dangling entry — `volume inspect` still
+// succeeds, but the sidecar can't mount the missing image and bootstrap fails
+// with "Operation not supported". Detect that and heal by recreating the
+// volume, so k3c recovers automatically instead of failing every `docker up`.
+func ensureDockerVolume(name string) error {
+	out, err := runContainer("volume", "inspect", name)
+	if err != nil {
+		logger.Info("creating docker image store volume (" + name + ")")
+		if out, err := runContainer("volume", "create", name); err != nil {
+			return fmt.Errorf("creating volume: %s", out)
+		}
+		return nil
+	}
+
+	// The record exists — verify its backing image is still on disk.
+	var vols []struct {
+		Configuration struct {
+			Source string `json:"source"`
+		} `json:"configuration"`
+	}
+	if err := json.Unmarshal([]byte(out), &vols); err != nil || len(vols) == 0 {
+		return nil // can't introspect; assume usable
+	}
+	src := vols[0].Configuration.Source
+	if src == "" {
+		return nil
+	}
+	if _, err := os.Stat(src); err == nil {
+		return nil // backing present — healthy
+	}
+
+	// Dangling: backing is gone. The runtime's `volume delete` errors when the
+	// backing entity is missing, so recreate a stub at the source path first so
+	// the stale record can be deleted, then create a fresh, valid volume.
+	logger.Warn("docker image store volume '" + name + "' is dangling (backing " + src + " missing) — recreating")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		return fmt.Errorf("recreating volume backing dir: %w", err)
+	}
+	if f, err := os.OpenFile(src, os.O_CREATE, 0o644); err == nil { //nolint:gosec // path from the runtime
+		_ = f.Close()
+	}
+	if out, err := runContainer("volume", "delete", name); err != nil {
+		return fmt.Errorf("removing dangling volume: %s", out)
+	}
+	logger.Info("creating docker image store volume (" + name + ")")
+	if out, err := runContainer("volume", "create", name); err != nil {
+		return fmt.Errorf("recreating volume: %s", out)
+	}
+	return nil
 }
 
 // applyDockerSysctls raises the sidecar VM's kernel limits (the configured

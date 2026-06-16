@@ -175,7 +175,11 @@ func caBundle(cfg *config.Config) ([]byte, error) {
 			return nil, err
 		}
 		if len(matches) == 0 {
-			return nil, fmt.Errorf("no CA certificates match %s", glob)
+			// A configured CA glob that matches nothing is normal (no corporate
+			// CAs, or per-cluster certs not generated yet). The system bundle is
+			// always included; corporate CAs are additive, so skip, don't fail.
+			logger.Warn("no CA certificates match " + glob + " — skipping")
+			continue
 		}
 		for _, crt := range matches {
 			data, err := os.ReadFile(crt)
