@@ -148,10 +148,12 @@ jobs:
       - name: Bundle container runtime into payload
         run: make bundle STAGING_DIR=/tmp/k3c-runtime/stage INIT_TAR=/tmp/k3c-runtime/init.tar
 
-      - name: Verify the bundled runtime ships every required plugin
+      - name: Verify the bundled runtime ships every required plugin (present + entitled)
         # guards against shipping a runtime missing a plugin (e.g. the
-        # transparent-egress container-network-gvnet, broken in v0.12.9–11)
-        run: go test -tags bundled ./runtime/... -run TestBundledPayloadHasRequiredPlugins -v
+        # transparent-egress container-network-gvnet, broken in v0.12.9–11) or
+        # with a VM plugin lacking the virtualization entitlement (the apiserver
+        # hang in v0.12.13). -run 'TestBundled' runs both bundled-payload guards.
+        run: go test -tags bundled ./runtime/... -run 'TestBundled' -v
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
