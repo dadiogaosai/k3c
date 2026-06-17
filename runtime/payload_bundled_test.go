@@ -7,6 +7,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -64,6 +68,90 @@ func TestBundledPayloadHasRequiredPlugins(t *testing.T) {
 		}
 		if !haveCfg[p] {
 			t.Errorf("bundled runtime is missing plugin config.toml: %s", p)
+		}
+	}
+}
+
+// virtualizationEntitledPlugins are the plugins that drive
+// Virtualization.framework and therefore MUST ship codesigned with the
+// com.apple.security.virtualization entitlement. Without it they fail to launch,
+// the apiserver hangs waiting on them at `container system start`, and every
+// container call blocks — the bug that wedged cluster create on bundled
+// installs (the fork's `make stage` once signed the installer pkg but not the
+// staged tree k3c bundles).
+var virtualizationEntitledPlugins = []string{
+	"container-runtime-linux",
+	"container-network-vmnet",
+	"container-network-gvnet",
+}
+
+// TestBundledVMPluginsAreEntitled extracts the VM-touching plugin binaries from
+// the embedded payload and asserts each carries the virtualization entitlement.
+// Runs only on macOS, where codesign is available (the bundled release is
+// macOS-only).
+func TestBundledVMPluginsAreEntitled(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("codesign is only available on macOS")
+	}
+	if _, err := exec.LookPath("codesign"); err != nil {
+		t.Skip("codesign not found")
+	}
+	if len(bundlePayload) == 0 {
+		t.Fatal("embedded bundle payload is empty (built with -tags bundled but no payload?)")
+	}
+
+	gz, err := gzip.NewReader(bytes.NewReader(bundlePayload))
+	if err != nil {
+		t.Fatalf("gunzip payload: %v", err)
+	}
+	defer gz.Close()
+
+	dir := t.TempDir()
+	extracted := map[string]string{}
+	tr := tar.NewReader(gz)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("reading payload tar: %v", err)
+		}
+		for _, p := range virtualizationEntitledPlugins {
+			if !strings.Contains(h.Name, "plugins/"+p+"/bin/"+p) {
+				continue
+			}
+			out := filepath.Join(dir, p)
+			f, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY, 0o755)
+			if err != nil {
+				t.Fatalf("create %s: %v", out, err)
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				t.Fatalf("extract %s: %v", p, err)
+			}
+			f.Close()
+			extracted[p] = out
+		}
+	}
+
+	const entitlement = "com.apple.security.virtualization"
+	for _, p := range virtualizationEntitledPlugins {
+		path, ok := extracted[p]
+		if !ok {
+			t.Errorf("plugin binary not found in payload: %s", p)
+			continue
+		}
+		// `codesign -d --entitlements -` prints the binary's entitlements (in a
+		// plist); a binary signed without them prints none.
+		out, err := exec.Command("codesign", "-d", "--entitlements", "-", path).CombinedOutput()
+		if err != nil {
+			t.Errorf("codesign inspect %s: %v\n%s", p, err, out)
+			continue
+		}
+		if !strings.Contains(string(out), entitlement) {
+			t.Errorf("plugin %s is missing the %s entitlement; it will fail to "+
+				"launch and hang container system start", p, entitlement)
 		}
 	}
 }

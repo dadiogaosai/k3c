@@ -13,11 +13,13 @@ LDFLAGS := -s -w \
 
 # Fork sources for the bundled runtime. Keep these in sync with
 # .github/workflows/goreleaser.yaml — the release builds the same refs.
+# Pinned to immutable commits (not the feat/gvnet-egress branch tip) so builds
+# are reproducible; bump deliberately when the runtime needs a fork update.
 FORKS_DIR             ?= tmp
 CONTAINER_REPO        ?= https://github.com/philipparndt/container
-CONTAINER_REF         ?= feat/gvnet-egress
+CONTAINER_REF         ?= 7ed75e128f6151b7297f6133bcc131737965d1ad
 CONTAINERIZATION_REPO ?= https://github.com/philipparndt/containerization
-CONTAINERIZATION_REF  ?= feat/gvnet-egress
+CONTAINERIZATION_REF  ?= ba71f683097dbff94cbf1d824427f99bff2a3557
 CONTAINER_DIR         := $(FORKS_DIR)/container
 CONTAINERIZATION_DIR  := $(FORKS_DIR)/containerization
 RUNTIME_STAGE         := $(FORKS_DIR)/stage
@@ -64,15 +66,18 @@ forks: ## clone or update the fork repos in ./tmp at the configured refs
 	@$(MAKE) --no-print-directory clone-fork DIR="$(CONTAINER_DIR)" REPO="$(CONTAINER_REPO)" REF="$(CONTAINER_REF)"
 	@$(MAKE) --no-print-directory clone-fork DIR="$(CONTAINERIZATION_DIR)" REPO="$(CONTAINERIZATION_REPO)" REF="$(CONTAINERIZATION_REF)"
 
+# REF may be a branch name or an immutable commit SHA, so fetch it explicitly
+# and check out the fetched commit detached (works for both; `clone --branch`
+# and `origin/$(REF)` would only work for a branch).
 clone-fork:
 	@if [ ! -d "$(DIR)/.git" ]; then \
 		echo "cloning $(REPO) @ $(REF) -> $(DIR)"; \
-		git clone --branch "$(REF)" "$(REPO)" "$(DIR)"; \
+		git clone -q "$(REPO)" "$(DIR)"; \
 	else \
 		echo "updating $(DIR) -> $(REF)"; \
-		git -C "$(DIR)" fetch -q origin "$(REF)"; \
-		git -C "$(DIR)" checkout -q -B "$(REF)" "origin/$(REF)"; \
 	fi
+	@git -C "$(DIR)" fetch -q origin "$(REF)"
+	@git -C "$(DIR)" checkout -q --detach FETCH_HEAD
 
 # build the container app + init image from the forks and assemble the runtime
 # stage; the (slow) Swift builds are skipped when the forks are unchanged

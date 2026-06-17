@@ -11,10 +11,13 @@ env:
   # Forks of apple/container with pause/resume + suspend-to-disk + transparent
   # egress (gvnet) support. The container repo's Package.swift references
   # ../containerization, so both are checked out as sibling directories.
+  # Pinned to immutable commits (not the feat/gvnet-egress branch tip) so a
+  # release is reproducible and can't silently pick up an untested fork change.
+  # Bump these deliberately when the runtime needs a fork update.
   CONTAINER_REPO: philipparndt/container
-  CONTAINER_REF: feat/gvnet-egress
+  CONTAINER_REF: 7ed75e128f6151b7297f6133bcc131737965d1ad
   CONTAINERIZATION_REPO: philipparndt/containerization
-  CONTAINERIZATION_REF: feat/gvnet-egress
+  CONTAINERIZATION_REF: ba71f683097dbff94cbf1d824427f99bff2a3557
 
 jobs:
   goreleaser:
