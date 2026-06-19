@@ -88,9 +88,10 @@ type model struct {
 	rows           []treeRow                         // flattened visible tree
 	cur            int                               // cursor into rows
 
-	lastTraffic map[string]trafficSample
-	netLine     string // traffic rates of the selected cluster
-	cacheLine   string // pull cache performance (global)
+	lastTraffic  map[string]trafficSample
+	netLine      string // traffic rates of the selected cluster
+	netTotalLine string // cumulative traffic of the selected cluster
+	cacheLine    string // pull cache performance (global)
 
 	width  int
 	height int
@@ -442,8 +443,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cur = max(0, len(m.rows)-1)
 		}
 		m.netLine = ""
+		m.netTotalLine = ""
 		if msg.traffic != nil {
 			s := *msg.traffic
+			m.netTotalLine = fmt.Sprintf("↓ %s  ↑ %s", humanBytes(s.rx), humanBytes(s.tx))
 			if prev, ok := m.lastTraffic[s.cluster]; ok {
 				elapsed := s.at.Sub(prev.at).Seconds()
 				// counters reset on a cluster restart: skip that sample
@@ -779,6 +782,7 @@ func (m model) move(delta int) (tea.Model, tea.Cmd) {
 	// blank it until the next refresh recomputes it for the new selection
 	if m.curName() != prev {
 		m.netLine = ""
+		m.netTotalLine = ""
 	}
 	return m, nil
 }
@@ -1001,11 +1005,15 @@ func (m model) infoPanelView() string {
 	if net == "" {
 		net = dimSt.Render("—")
 	}
+	total := m.netTotalLine
+	if total == "" {
+		total = dimSt.Render("—")
+	}
 	cache := m.cacheLine
 	if cache == "" {
 		cache = dimSt.Render("—")
 	}
-	rows = append(rows, panelLabel("net")+net, panelLabel("cache")+cache)
+	rows = append(rows, panelLabel("net")+net, panelLabel("total")+total, panelLabel("cache")+cache)
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
