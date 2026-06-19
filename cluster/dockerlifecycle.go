@@ -189,5 +189,21 @@ func DockerSidecarInfo(cfg *config.Config) (ClusterInfo, bool) {
 		RAM:      ram,
 		Context:  cfg.DockerContext,
 		Kind:     "docker",
+		Active:   readActive(cfg).Sidecar,
 	}, true
+}
+
+// ActivateSidecar makes the docker sidecar the active target: it owns the host
+// ports it shares with the active cluster (contested ports). The sidecar is
+// brought up (resumed if paused) first, mirroring cluster activation.
+func ActivateSidecar(cfg *config.Config) error {
+	if isDockerPaused(cfg) {
+		if err := DockerResume(cfg); err != nil {
+			return err
+		}
+	}
+	if err := DockerUp(cfg, false); err != nil {
+		return err
+	}
+	return setActiveSidecar(cfg)
 }

@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -134,12 +136,17 @@ func servePullCache(cfg *config.Config) error {
 		}
 	}
 	logger.Info("listening on 0.0.0.0:" + cfg.PullCachePort + " (pull-through cache)")
+	ln, err := net.Listen("tcp", "0.0.0.0:"+cfg.PullCachePort)
+	if err != nil {
+		return err
+	}
 	server := &http.Server{
-		Addr:              "0.0.0.0:" + cfg.PullCachePort,
 		Handler:           p,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	return server.ListenAndServe()
+	// route the port to the sidecar when it is the active target and publishes it
+	port, _ := strconv.Atoi(cfg.PullCachePort)
+	return server.Serve(arbitratedListener(ln, cfg, port))
 }
 
 var pullPathRe = regexp.MustCompile(`^/v2/(.+)/(manifests|blobs)/([^/]+)$`)

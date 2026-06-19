@@ -33,7 +33,12 @@ type SnapshotInfo struct {
 // with their state, sorted by name.
 func Clusters(cfg *config.Config) []ClusterInfo {
 	state := clusterStates()
-	active := readActive(cfg).Cluster
+	a := readActive(cfg)
+	// while the sidecar is the active target, no cluster carries the ★
+	active := ""
+	if !a.Sidecar {
+		active = a.Cluster
+	}
 	names := make([]string, 0, len(state))
 	for cluster := range state {
 		names = append(names, cluster)

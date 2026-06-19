@@ -96,12 +96,17 @@ func applyPorts(cfg *config.Config, ports clusterPorts) {
 	}
 }
 
-// activeState names the cluster the daemon routes public traffic to.
+// activeState names the cluster the daemon routes public traffic to. When
+// Sidecar is set the docker sidecar is the active target: it owns every host
+// port both it and the active cluster publish (contested ports). The Cluster
+// fields are kept either way, so non-contested cluster routing (registry, the
+// :443 egress path) still works while the sidecar holds the contested ports.
 type activeState struct {
 	Cluster        string   `yaml:"cluster"`
 	IngressPort    string   `yaml:"ingressPort"`
 	RegistryPort   string   `yaml:"registryPort"`
 	IngressDomains []string `yaml:"ingressDomains"`
+	Sidecar        bool     `yaml:"sidecar"`
 }
 
 func activeFile(cfg *config.Config) string {
@@ -130,20 +135,35 @@ func ActiveClusterName() string {
 	return state.Cluster
 }
 
-// setActive routes the daemon's public ports to this cluster.
+// setActive routes the daemon's public ports to this cluster and makes the
+// cluster the active target — Sidecar is cleared, so activating a cluster (incl.
+// the implicit activate on start/resume) reclaims any contested ports the
+// sidecar held.
 func setActive(cfg *config.Config) error {
-	state := activeState{
+	return writeActive(cfg, activeState{
 		Cluster:        cfg.Cluster,
 		IngressPort:    cfg.IngressPortInternal,
 		RegistryPort:   cfg.RegistryPortInternal,
 		IngressDomains: cfg.IngressDomains,
-	}
+	})
+}
+
+// setActiveSidecar makes the docker sidecar the active target: it now owns the
+// contested host ports. The cluster routing fields are preserved, so the last
+// active cluster stays the registry/kube fallback for non-contested traffic.
+func setActiveSidecar(cfg *config.Config) error {
+	state := readActive(cfg)
+	state.Sidecar = true
+	return writeActive(cfg, state)
+}
+
+func writeActive(cfg *config.Config, state activeState) error {
 	data, err := yaml.Marshal(state)
 	if err != nil {
 		return err
 	}
 	if err := os.WriteFile(activeFile(cfg), data, 0o644); err != nil {
-		return fmt.Errorf("recording active cluster: %w", err)
+		return fmt.Errorf("recording active target: %w", err)
 	}
 	return nil
 }

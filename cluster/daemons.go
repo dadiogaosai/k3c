@@ -66,14 +66,103 @@ func isLoopback(addr net.Addr) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// clusterIngressTarget is where the active cluster's HTTPS ingress is
-// reachable: the sidecar VM for a nested k3d cluster (whose ingress lives on
-// the VM, not a host-local port), else the host-local published port.
+// clusterIngressTarget is where loopback :443 ingress is routed: the sidecar VM
+// when the sidecar is the active target and publishes :443 (e.g. a nested k3d
+// cluster whose ingress lives on the VM), else the active cluster's host-local
+// ingress port.
 func clusterIngressTarget(active activeState) string {
-	if si := sidecarIngressTarget(); si != "" {
-		return si
+	if active.Sidecar {
+		if si := sidecarPortTarget(443); si != "" {
+			return si
+		}
 	}
 	return net.JoinHostPort("127.0.0.1", active.IngressPort)
+}
+
+// daemonHostPorts is the set of public host ports the daemon binds — the ports a
+// sidecar publish can contest. Arbitration hands a contested port to the sidecar
+// when the sidecar is the active target.
+func daemonHostPorts(cfg *config.Config) map[int]bool {
+	owned := map[int]bool{443: true}
+	add := func(p string) {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 {
+			owned[n] = true
+		}
+	}
+	add(cfg.ProxyPort)
+	add(cfg.RegistryPort)
+	if cfg.PullCacheEnabled {
+		add(cfg.PullCachePort)
+	}
+	for _, p := range cfg.EgressPorts {
+		owned[p] = true
+	}
+	for _, f := range cfg.EgressForwards {
+		add(f.Port)
+	}
+	return owned
+}
+
+// sidecarWins returns the sidecar endpoint for a contested host port when the
+// sidecar is the active target and the connection is host-origin (loopback).
+// VM/pod egress (non-loopback) is never redirected.
+func sidecarWins(cfg *config.Config, port int, remote net.Addr) string {
+	if !isLoopback(remote) || !readActive(cfg).Sidecar {
+		return ""
+	}
+	return sidecarPortTarget(port)
+}
+
+// arbListener wraps a listener so contested loopback connections are spliced to
+// the sidecar (when it is the active target) before they reach the wrapped
+// server — used for the pull-cache, whose handler is an http.Server.
+type arbListener struct {
+	net.Listener
+	cfg  *config.Config
+	port int
+}
+
+func arbitratedListener(ln net.Listener, cfg *config.Config, port int) net.Listener {
+	return &arbListener{Listener: ln, cfg: cfg, port: port}
+}
+
+func (l *arbListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		target := sidecarWins(l.cfg, l.port, conn.RemoteAddr())
+		if target == "" {
+			return conn, nil
+		}
+		go func() {
+			defer conn.Close()
+			upstream, err := net.DialTimeout("tcp", target, connectTimeout)
+			if err != nil {
+				return
+			}
+			splice(conn, upstream)
+		}()
+	}
+}
+
+// arbitrate wraps a daemon handler so a loopback connection to a contested port
+// is spliced straight to the sidecar when the sidecar is the active target;
+// otherwise the normal handler (which routes to the active cluster) runs.
+func arbitrate(cfg *config.Config, port int, h func(net.Conn)) func(net.Conn) {
+	return func(conn net.Conn) {
+		if target := sidecarWins(cfg, port, conn.RemoteAddr()); target != "" {
+			defer conn.Close()
+			upstream, err := net.DialTimeout("tcp", target, connectTimeout)
+			if err != nil {
+				return
+			}
+			splice(conn, upstream)
+			return
+		}
+		h(conn)
+	}
 }
 
 func splice(a, b net.Conn) {
@@ -354,7 +443,12 @@ func RunDaemons(cfg *config.Config) error {
 	_ = os.WriteFile(daemonsVersionFile(cfg), []byte(daemonsVersion(cfg)+"\n"), 0o644)
 	startAutoReclaim(cfg)
 	errCh := make(chan error, 3)
-	go func() { errCh <- serve("0.0.0.0:"+cfg.ProxyPort, handleProxyConn) }()
+	proxyPort, _ := strconv.Atoi(cfg.ProxyPort)
+	go func() {
+		errCh <- serve("0.0.0.0:"+cfg.ProxyPort, arbitrate(cfg, proxyPort, handleProxyConn))
+	}()
+	// :443 arbitrates inside handleSNIConn (clusterIngressTarget), so its egress
+	// path is preserved — only the loopback ingress target follows the toggle
 	go func() {
 		errCh <- serve("0.0.0.0:443", func(c net.Conn) { handleSNIConn(c, cfg) })
 	}()
@@ -364,13 +458,14 @@ func RunDaemons(cfg *config.Config) error {
 		}
 		port := strconv.Itoa(p)
 		go func() {
-			errCh <- serve("0.0.0.0:"+port, func(c net.Conn) { handleEgressPortConn(c, port) })
+			errCh <- serve("0.0.0.0:"+port, arbitrate(cfg, p, func(c net.Conn) { handleEgressPortConn(c, port) }))
 		}()
 	}
 	for _, f := range cfg.EgressForwards {
 		fw := f
+		fwPort, _ := strconv.Atoi(fw.Port)
 		go func() {
-			errCh <- serve("0.0.0.0:"+fw.Port, func(c net.Conn) { handleForwardConn(c, fw.Target) })
+			errCh <- serve("0.0.0.0:"+fw.Port, arbitrate(cfg, fwPort, func(c net.Conn) { handleForwardConn(c, fw.Target) }))
 		}()
 	}
 	if cfg.PullCacheEnabled {
@@ -386,8 +481,9 @@ func RunDaemons(cfg *config.Config) error {
 	if len(ignoredResources(cfg)) > 0 {
 		go func() { errCh <- serveWebhook(cfg) }()
 	}
+	registryPort, _ := strconv.Atoi(cfg.RegistryPort)
 	go func() {
-		errCh <- serve("0.0.0.0:"+cfg.RegistryPort, func(c net.Conn) { handleRegistryConn(c, cfg) })
+		errCh <- serve("0.0.0.0:"+cfg.RegistryPort, arbitrate(cfg, registryPort, func(c net.Conn) { handleRegistryConn(c, cfg) }))
 	}()
 	return <-errCh
 }

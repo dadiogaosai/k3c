@@ -116,6 +116,20 @@ var dockerEnvCmd = &cobra.Command{
 	},
 }
 
+var dockerActivateCmd = &cobra.Command{
+	Use:   "activate",
+	Short: "Make the sidecar the active target (it owns host ports it shares with the active cluster)",
+	Long: `Make the docker sidecar the active target.
+
+The sidecar then owns every host port both it and the active cluster publish
+(contested ports), e.g. :443 ingress. The sidecar is brought up first.
+Activating a cluster (incl. on start/resume) hands those ports back.`,
+	Args: cobra.NoArgs,
+	Run: func(cmd *cobra.Command, args []string) {
+		fail(cluster.ActivateSidecar(loadConfigDefault(nil)))
+	},
+}
+
 var dockerPauseCmd = &cobra.Command{
 	Use:   "pause",
 	Short: "Freeze the sidecar in memory (instant resume; freezes the whole nested cluster)",
@@ -210,7 +224,7 @@ func init() {
 	dockerReclaimCmd.Flags().BoolVar(&dockerReclaimRelease, "release", false,
 		"deflate the balloon and give the sidecar its full configured memory again")
 	dockerSnapshotCmd.AddCommand(dockerSnapshotSaveCmd, dockerSnapshotRestoreCmd, dockerSnapshotListCmd, dockerSnapshotDeleteCmd)
-	dockerCmd.AddCommand(dockerUpCmd, dockerDownCmd, dockerRmCmd, dockerStatusCmd, dockerEnvCmd,
+	dockerCmd.AddCommand(dockerUpCmd, dockerActivateCmd, dockerDownCmd, dockerRmCmd, dockerStatusCmd, dockerEnvCmd,
 		dockerPauseCmd, dockerResumeCmd, dockerSuspendCmd, dockerReclaimCmd, dockerSnapshotCmd,
 		dockerBuildkitCmd)
 	rootCmd.AddCommand(dockerCmd)

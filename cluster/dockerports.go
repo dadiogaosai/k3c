@@ -65,24 +65,23 @@ func startDockerSocket(cfg *config.Config) {
 	}()
 }
 
-// sidecarIngress holds the sidecar's published HTTPS ingress endpoint
-// ("<vm-ip>:443") when a nested k3d cluster publishes :443 there, or "" when
-// there is no sidecar (or it publishes no ingress). A nested cluster's ingress
-// lives on the sidecar VM, not on a host-local port, so the SNI gateway reads
-// this to route browser ingress to it. Refreshed by the port poll below.
-var sidecarIngress atomic.Pointer[string]
+// sidecarPorts maps every host port the sidecar currently publishes to its
+// "<vm-ip>:port" endpoint. The daemon reads it to route contested ports (a port
+// both it and the sidecar serve) to the sidecar when the sidecar is the active
+// target — including :443 ingress for a nested k3d cluster whose ingress lives
+// on the sidecar VM. Refreshed by the port poll below.
+var sidecarPorts atomic.Pointer[map[int]string]
 
-// sidecarIngressTarget returns the nested cluster's ingress endpoint, or "".
-func sidecarIngressTarget() string {
-	if p := sidecarIngress.Load(); p != nil {
-		return *p
+// sidecarPortTarget returns the sidecar endpoint publishing host port, or "".
+func sidecarPortTarget(port int) string {
+	if m := sidecarPorts.Load(); m != nil {
+		return (*m)[port]
 	}
 	return ""
 }
 
-func storeSidecarIngress(target string) {
-	t := target
-	sidecarIngress.Store(&t)
+func storeSidecarPorts(m map[int]string) {
+	sidecarPorts.Store(&m)
 }
 
 // Docker published-port forwarding. Docker publishes container ports on
@@ -108,36 +107,38 @@ type portBind struct {
 func (b portBind) addr() string { return net.JoinHostPort(b.host, strconv.Itoa(b.port)) }
 
 func startDockerPortForward(cfg *config.Config) {
+	owned := daemonHostPorts(cfg)
 	go func() {
 		active := map[string]net.Listener{}
 		for {
-			reconcileDockerPorts(active)
+			reconcileDockerPorts(active, owned)
 			time.Sleep(dockerPortPoll)
 		}
 	}()
 }
 
 // reconcileDockerPorts brings the set of host listeners in line with the
-// sidecar's currently published ports. Listeners are keyed by host:port so
+// sidecar's currently published ports, and records every published port for
+// the daemon's contested-port arbitration. Listeners are keyed by host:port so
 // the same port published on different addresses is tracked independently.
-func reconcileDockerPorts(active map[string]net.Listener) {
+func reconcileDockerPorts(active map[string]net.Listener, owned map[int]bool) {
 	ip := containerIP(dockerName)
 	desired := map[string]portBind{}
-	ingress := ""
+	published := map[int]string{}
 	if ip != "" {
 		for _, b := range dockerPublishedPorts(ip) {
-			// :443 is the cluster ingress. The SNI gateway owns host :443
-			// (for pod egress too) and forwards browser ingress to the
-			// sidecar, so don't also bind it here — just record the endpoint
-			// for the gateway to route to.
-			if b.port == 443 {
-				ingress = fmt.Sprintf("%s:443", ip)
+			published[b.port] = fmt.Sprintf("%s:%d", ip, b.port)
+			// daemon-owned ports (:443 ingress, registry, proxy, egress,
+			// pull-cache) are contested: the daemon already holds the host
+			// bind and its arbitration wrapper routes them to the sidecar when
+			// the sidecar is the active target. Don't also bind them here.
+			if owned[b.port] {
 				continue
 			}
 			desired[b.addr()] = b
 		}
 	}
-	storeSidecarIngress(ingress)
+	storeSidecarPorts(published)
 
 	for key, b := range desired {
 		if _, ok := active[key]; ok {

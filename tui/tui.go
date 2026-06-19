@@ -1,5 +1,7 @@
-// Package tui is the interactive terminal UI of k3c (k3c ui): clusters and
-// their snapshots side by side, with single-key lifecycle operations.
+// Package tui is the interactive terminal UI of k3c (k3c ui): a k9s-style
+// tree of machines with their snapshots as children, a top header with a
+// context info panel and shortcut menu, modal dialogs for input, and a
+// session-long command log.
 //
 // Operations run k3c itself as a subprocess: the CLI commands keep their
 // logging and config resolution, the TUI stays responsive and shows the
@@ -17,6 +19,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -24,12 +27,26 @@ import (
 	"k3c/config"
 )
 
-type pane int
+// rowKind distinguishes a top-level machine row from a nested snapshot row.
+type rowKind int
 
 const (
-	paneClusters pane = iota
-	paneSnapshots
+	rowMachine rowKind = iota
+	rowSnapshot
 )
+
+// treeRow is one visible line of the flattened machine/snapshot tree. A
+// snapshot row always carries the index of its parent machine, so
+// machine-scoped operations work whether the cursor sits on the machine or on
+// one of its snapshots.
+type treeRow struct {
+	kind        rowKind
+	machine     int    // index into model.clusters
+	snapName    string // set on a snapshot row
+	snapMode    string
+	snapWhen    string
+	placeholder string // dim filler row ("loading…", "no snapshots …")
+}
 
 // confirm is a pending yes/no question and the command an answer of yes
 // runs. A non-nil noCmd runs on decline instead of cancelling — used for
@@ -43,7 +60,7 @@ type confirm struct {
 // askMsg opens a (follow-up) confirmation.
 type askMsg struct{ c confirm }
 
-// nameInput is the open "new snapshot" prompt.
+// nameInput is the open "new snapshot" wizard.
 type nameInput struct {
 	input   textinput.Model
 	cluster string
@@ -51,32 +68,45 @@ type nameInput struct {
 	docker  bool // snapshot the docker sidecar instead of a cluster
 }
 
+// commandRun is one executed operation, kept for the whole session and shown
+// in the command-log dialog.
+type commandRun struct {
+	desc   string
+	args   []string
+	output string
+	err    error
+	when   time.Time
+}
+
 type model struct {
 	cfg *config.Config
 
-	clusters     []cluster.ClusterInfo
-	snapshots    []cluster.SnapshotInfo
-	snapsLoading bool // snapshots of the newly selected cluster in flight
-	cCur         int
-	sCur         int
-	focus        pane
+	clusters       []cluster.ClusterInfo
+	snapsByMachine map[string][]cluster.SnapshotInfo // snapshots of every loaded machine
+	expanded       map[string]bool                   // machine name → expanded (default true)
+	loading        map[string]bool                   // machine name → snapshot load in flight
+	rows           []treeRow                         // flattened visible tree
+	cur            int                               // cursor into rows
 
 	lastTraffic map[string]trafficSample
 	netLine     string // traffic rates of the selected cluster
-	cacheLine   string // pull cache performance
+	cacheLine   string // pull cache performance (global)
 
 	width  int
 	height int
 
 	spin     spinner.Model
-	busy     string // running operation, "" when idle
-	opLine   string // latest output line of the running operation
+	busy     string   // running operation, "" when idle
+	busyArgs []string // args of the running operation (recorded into the log)
+	opLine   string   // latest output line of the running operation
 	opCh     chan opEventMsg
 	status   string // last result line
 	failed   bool   // last result was an error
-	output   string // full output of the last operation
-	showOut  bool
-	showHelp bool // full keybinding help (toggled with ?)
+
+	commands []commandRun // session-long command history
+	logVP    viewport.Model
+	showLog  bool // command-log dialog open
+	showHelp bool // keybinding help dialog open
 
 	confirm *confirm
 	input   *nameInput
@@ -87,7 +117,14 @@ type model struct {
 func New(cfg *config.Config) tea.Model {
 	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot))
 	sp.Style = lipgloss.NewStyle().Foreground(accent)
-	return model{cfg: cfg, spin: sp, lastTraffic: map[string]trafficSample{}}
+	return model{
+		cfg:            cfg,
+		spin:           sp,
+		lastTraffic:    map[string]trafficSample{},
+		snapsByMachine: map[string][]cluster.SnapshotInfo{},
+		expanded:       map[string]bool{},
+		loading:        map[string]bool{},
+	}
 }
 
 // Run starts the TUI.
@@ -99,13 +136,16 @@ func Run(cfg *config.Config) error {
 // --- messages ---
 
 type dataMsg struct {
-	clusters  []cluster.ClusterInfo
-	snapshots []cluster.SnapshotInfo
-	// the cluster the snapshots were listed for: a reply that raced a
-	// newer selection must not overwrite its snapshots
-	forCluster string
-	traffic    *trafficSample
-	cacheStats *cluster.PullStats
+	clusters       []cluster.ClusterInfo
+	snapsByMachine map[string][]cluster.SnapshotInfo
+	traffic        *trafficSample
+	cacheStats     *cluster.PullStats
+}
+
+// snapsMsg carries a single machine's snapshots — an on-expand lazy load.
+type snapsMsg struct {
+	machine string
+	snaps   []cluster.SnapshotInfo
 }
 
 // trafficSample is a point-in-time reading of a cluster VM's cumulative
@@ -127,35 +167,59 @@ type opEventMsg struct {
 
 type tickMsg struct{}
 
+// --- selection helpers ---
+
+func (m model) curRow() (treeRow, bool) {
+	if m.cur >= 0 && m.cur < len(m.rows) {
+		return m.rows[m.cur], true
+	}
+	return treeRow{}, false
+}
+
+func (m model) curMachine() (cluster.ClusterInfo, bool) {
+	r, ok := m.curRow()
+	if !ok || r.machine < 0 || r.machine >= len(m.clusters) {
+		return cluster.ClusterInfo{}, false
+	}
+	return m.clusters[r.machine], true
+}
+
+func (m model) curName() string {
+	if c, ok := m.curMachine(); ok {
+		return c.Name
+	}
+	return ""
+}
+
+func (m model) curKind() string {
+	if c, ok := m.curMachine(); ok {
+		return c.Kind
+	}
+	return ""
+}
+
+// onSnapshot reports whether the cursor sits on a real snapshot row (not a
+// placeholder filler).
+func (m model) onSnapshot() bool {
+	r, ok := m.curRow()
+	return ok && r.kind == rowSnapshot && r.snapName != ""
+}
+
+func (m model) curSnapshot() string {
+	if r, ok := m.curRow(); ok && r.kind == rowSnapshot {
+		return r.snapName
+	}
+	return ""
+}
+
 // --- commands ---
 
-func (m model) selectedCluster() string {
-	if m.cCur < len(m.clusters) {
-		return m.clusters[m.cCur].Name
-	}
-	return ""
-}
-
-func (m model) selectedSnapshot() string {
-	if m.sCur < len(m.snapshots) {
-		return m.snapshots[m.sCur].Name
-	}
-	return ""
-}
-
-// selectedKind returns the kind of the selected clusters-pane row ("" for a
-// cluster, "docker" for the sidecar).
-func (m model) selectedKind() string {
-	if m.cCur < len(m.clusters) {
-		return m.clusters[m.cCur].Kind
-	}
-	return ""
-}
-
-// dockerKey maps a clusters-pane key to a docker-sidecar lifecycle operation.
+// dockerKey maps a key to a docker-sidecar lifecycle operation.
 func (m model) dockerKey(key string) (tea.Model, tea.Cmd) {
 	switch key {
-	case "enter", "s":
+	case "enter":
+		return m.startOp("activate docker sidecar", "docker", "activate")
+	case "s":
 		return m.startOp("docker sidecar up", "docker", "up")
 	case "S":
 		return m.startOp("docker sidecar down", "docker", "down")
@@ -184,7 +248,13 @@ func (m model) dockerKey(key string) (tea.Model, tea.Cmd) {
 }
 
 func (m model) refresh() tea.Cmd {
-	cfg, name := m.cfg, m.selectedCluster()
+	cfg := m.cfg
+	curName := m.curName()
+	pullCache := cfg.PullCacheEnabled
+	expanded := make(map[string]bool, len(m.expanded))
+	for k, v := range m.expanded {
+		expanded[k] = v
+	}
 	return func() tea.Msg {
 		clusters := cluster.Clusters(cfg)
 		// the docker sidecar is another managed VM: list it after the clusters
@@ -192,26 +262,32 @@ func (m model) refresh() tea.Cmd {
 		if sidecar, ok := cluster.DockerSidecarInfo(cfg); ok {
 			clusters = append(clusters, sidecar)
 		}
-		// keep the selection on reloads; fall back to the first cluster
-		current := name
-		if current == "" && len(clusters) > 0 {
-			current = clusters[0].Name
-		}
-		snaps := cluster.Snapshots(cfg, current)
+		// load snapshots of every expanded machine (new machines default to
+		// expanded), so the tree shows children without an extra keystroke
+		snaps := make(map[string][]cluster.SnapshotInfo)
 		for _, c := range clusters {
-			if c.Name == current && c.Kind == "docker" {
-				snaps = cluster.DockerSnapshots(cfg)
+			exp, ok := expanded[c.Name]
+			if !ok {
+				exp = true
+			}
+			if !exp {
+				continue
+			}
+			if c.Kind == "docker" {
+				snaps[c.Name] = cluster.DockerSnapshots(cfg)
+			} else {
+				snaps[c.Name] = cluster.Snapshots(cfg, c.Name)
 			}
 		}
-		msg := dataMsg{clusters: clusters, snapshots: snaps, forCluster: current}
+		msg := dataMsg{clusters: clusters, snapsByMachine: snaps}
 		for _, c := range clusters {
-			if c.Name == current && c.Server == "running" {
-				if rx, tx, err := cluster.Traffic(cfg, current); err == nil {
-					msg.traffic = &trafficSample{cluster: current, rx: rx, tx: tx, at: time.Now()}
+			if c.Name == curName && c.Server == "running" {
+				if rx, tx, err := cluster.Traffic(cfg, curName); err == nil {
+					msg.traffic = &trafficSample{cluster: curName, rx: rx, tx: tx, at: time.Now()}
 				}
 			}
 		}
-		if cfg.PullCacheEnabled {
+		if pullCache {
 			if stats, err := cluster.PullCacheStats(cfg); err == nil {
 				msg.cacheStats = stats
 			}
@@ -220,23 +296,42 @@ func (m model) refresh() tea.Cmd {
 	}
 }
 
-// snapsMsg carries a snapshots-only reload (cluster navigation).
-type snapsMsg struct {
-	snapshots  []cluster.SnapshotInfo
-	forCluster string
+// refreshSnapshots loads one machine's snapshots — a directory listing, fast
+// enough to keep an expand snappy instead of waiting for the next full refresh.
+func (m model) refreshSnapshots(name, kind string) tea.Cmd {
+	cfg := m.cfg
+	return func() tea.Msg {
+		if kind == "docker" {
+			return snapsMsg{machine: name, snaps: cluster.DockerSnapshots(cfg)}
+		}
+		return snapsMsg{machine: name, snaps: cluster.Snapshots(cfg, name)}
+	}
 }
 
-// refreshSnapshots reloads only the selected cluster's snapshots — a
-// directory listing, fast enough for cursor navigation, unlike the full
-// cluster state refresh.
-func (m model) refreshSnapshots() tea.Cmd {
-	cfg, name, docker := m.cfg, m.selectedCluster(), m.selectedKind() == "docker"
-	return func() tea.Msg {
-		if docker {
-			return snapsMsg{snapshots: cluster.DockerSnapshots(cfg), forCluster: name}
+// rebuildRows recomputes the flattened visible tree from clusters, the
+// expanded set, and the loaded snapshots.
+func (m *model) rebuildRows() {
+	rows := make([]treeRow, 0, len(m.clusters))
+	for i, c := range m.clusters {
+		rows = append(rows, treeRow{kind: rowMachine, machine: i})
+		if !m.expanded[c.Name] {
+			continue
 		}
-		return snapsMsg{snapshots: cluster.Snapshots(cfg, name), forCluster: name}
+		switch {
+		case m.loading[c.Name]:
+			rows = append(rows, treeRow{kind: rowSnapshot, machine: i, placeholder: "loading…"})
+		case len(m.snapsByMachine[c.Name]) == 0:
+			rows = append(rows, treeRow{kind: rowSnapshot, machine: i, placeholder: "no snapshots — press c to create one"})
+		default:
+			for _, s := range m.snapsByMachine[c.Name] {
+				rows = append(rows, treeRow{
+					kind: rowSnapshot, machine: i,
+					snapName: s.Name, snapMode: s.Mode, snapWhen: s.Created,
+				})
+			}
+		}
 	}
+	m.rows = rows
 }
 
 func tick() tea.Cmd {
@@ -312,20 +407,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		if m.showLog {
+			m.sizeLog()
+		}
 		return m, nil
 
 	case dataMsg:
 		m.clusters = msg.clusters
-		if m.cCur >= len(m.clusters) {
-			m.cCur = max(0, len(m.clusters)-1)
-		}
-		// only accept snapshots fetched for the current selection
-		if msg.forCluster == m.selectedCluster() {
-			m.snapshots = msg.snapshots
-			m.snapsLoading = false
-			if m.sCur >= len(m.snapshots) {
-				m.sCur = max(0, len(m.snapshots)-1)
+		// new machines default to expanded; user toggles are preserved
+		for _, c := range m.clusters {
+			if _, ok := m.expanded[c.Name]; !ok {
+				m.expanded[c.Name] = true
 			}
+		}
+		for name, s := range msg.snapsByMachine {
+			m.snapsByMachine[name] = s
+			delete(m.loading, name)
+		}
+		m.rebuildRows()
+		if m.cur >= len(m.rows) {
+			m.cur = max(0, len(m.rows)-1)
 		}
 		m.netLine = ""
 		if msg.traffic != nil {
@@ -334,29 +435,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				elapsed := s.at.Sub(prev.at).Seconds()
 				// counters reset on a cluster restart: skip that sample
 				if elapsed > 0 && s.rx >= prev.rx && s.tx >= prev.tx {
-					m.netLine = fmt.Sprintf("net  ↓ %s/s  ↑ %s/s   (total ↓ %s  ↑ %s)",
+					m.netLine = fmt.Sprintf("↓ %s/s  ↑ %s/s",
 						humanBytes(int64(float64(s.rx-prev.rx)/elapsed)),
-						humanBytes(int64(float64(s.tx-prev.tx)/elapsed)),
-						humanBytes(s.rx), humanBytes(s.tx))
+						humanBytes(int64(float64(s.tx-prev.tx)/elapsed)))
 				}
 			}
 			m.lastTraffic[s.cluster] = s
 		}
 		m.cacheLine = ""
 		if st := msg.cacheStats; st != nil && st.Hits+st.Misses > 0 {
-			m.cacheLine = fmt.Sprintf("pull cache  %.0f%% hits   from cache %s · upstream %s",
+			m.cacheLine = fmt.Sprintf("%.0f%% hits · cache %s · up %s",
 				float64(st.Hits)*100/float64(st.Hits+st.Misses),
 				humanBytes(st.HitBytes), humanBytes(st.MissBytes))
 		}
 		return m, nil
 
 	case snapsMsg:
-		if msg.forCluster == m.selectedCluster() {
-			m.snapshots = msg.snapshots
-			m.snapsLoading = false
-			if m.sCur >= len(m.snapshots) {
-				m.sCur = max(0, len(m.snapshots)-1)
-			}
+		m.snapsByMachine[msg.machine] = msg.snaps
+		delete(m.loading, msg.machine)
+		m.rebuildRows()
+		if m.cur >= len(m.rows) {
+			m.cur = max(0, len(m.rows)-1)
 		}
 		return m, nil
 
@@ -366,8 +465,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case opStartMsg:
 		m.busy = msg.desc
+		m.busyArgs = msg.args
 		m.status = ""
-		m.showOut = false
 		m.opLine = ""
 		m.opCh = startOpStream(msg.args)
 		return m, tea.Batch(waitOp(m.opCh), m.spin.Tick)
@@ -377,17 +476,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.opLine = msg.line
 			return m, waitOp(m.opCh)
 		}
-		desc := m.busy
+		desc, args := m.busy, m.busyArgs
 		m.busy = ""
+		m.busyArgs = nil
 		m.opLine = ""
 		m.opCh = nil
-		m.output = msg.output
+		m.commands = append(m.commands, commandRun{
+			desc: desc, args: args, output: msg.output, err: msg.err, when: time.Now(),
+		})
 		if msg.err != nil {
 			m.failed = true
 			m.status = desc + " failed: " + lastLine(msg.output, msg.err)
 		} else {
 			m.failed = false
 			m.status = desc + " ✓"
+		}
+		if m.showLog {
+			m.logVP.SetContent(m.logContent())
 		}
 		return m, m.refresh()
 
@@ -409,6 +514,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// the command-log dialog: scrolling keys drive the viewport, esc/o close
+	if m.showLog {
+		switch msg.String() {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		case "l", "esc", "?":
+			m.showLog = false
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.logVP, cmd = m.logVP.Update(msg)
+		return m, cmd
+	}
+
 	// the full-screen help eats every key: any key closes it (q/ctrl+c quits)
 	if m.showHelp {
 		switch msg.String() {
@@ -437,7 +556,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// the snapshot-name prompt eats every key
+	// the snapshot wizard eats every key
 	if m.input != nil {
 		switch msg.Type {
 		case tea.KeyEscape:
@@ -478,58 +597,58 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// global navigation and dialogs
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
-
-	case "tab", "left", "right", "h", "l":
-		if m.focus == paneClusters {
-			m.focus = paneSnapshots
-		} else {
-			m.focus = paneClusters
-		}
-		return m, nil
-
 	case "up", "k":
 		return m.move(-1)
-
 	case "down", "j":
 		return m.move(1)
-
+	case "right":
+		return m.expand()
+	case "left":
+		return m.collapse()
 	case "g", "f5":
 		return m, m.refresh()
-
-	case "o":
-		m.showOut = !m.showOut
+	case "l":
+		m.openLog()
 		return m, nil
-
 	case "?":
-		m.showHelp = !m.showHelp
+		m.showHelp = true
 		return m, nil
 	}
 
 	if m.busy != "" { // one operation at a time
 		return m, nil
 	}
-	name := m.selectedCluster()
+	name := m.curName()
 	if name == "" {
 		return m, nil
 	}
+	kind := m.curKind()
 
-	// the docker sidecar (clusters pane) has its own lifecycle verbs
-	if m.focus == paneClusters && m.selectedKind() == "docker" {
-		return m.dockerKey(msg.String())
+	// the docker sidecar has its own lifecycle verbs; lifecycle keys target the
+	// sidecar from any of its rows, machine-only verbs from its machine row
+	if kind == "docker" {
+		if r, _ := m.curRow(); r.kind == rowMachine {
+			return m.dockerKey(msg.String())
+		}
+		switch msg.String() {
+		case "s", "S", "p", "r", "z":
+			return m.dockerKey(msg.String())
+		case "u", "m", "M":
+			return m, nil // not applicable to the docker sidecar
+		}
+		// enter / c / d / x / e fall through to the snapshot logic below
 	}
 
 	switch msg.String() {
 	case "enter":
-		if m.focus == paneSnapshots {
-			snap := m.selectedSnapshot()
-			if snap == "" {
-				return m, nil
-			}
+		if m.onSnapshot() {
+			snap := m.curSnapshot()
 			restore := m.opCmd("restore of "+snap+" into "+name, "snapshot", "restore", name, snap)
-			if m.selectedKind() == "docker" {
+			if kind == "docker" {
 				restore = m.opCmd("restore of "+snap+" into the docker sidecar", "docker", "snapshot", "restore", snap)
 			}
 			m.confirm = &confirm{
@@ -538,9 +657,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		if m.selectedKind() == "docker" {
-			return m.dockerKey("enter")
-		}
+		// machine row (docker machine rows are handled above)
 		return m.startOp("activate "+name, "cluster", "activate", name)
 
 	case "s":
@@ -555,7 +672,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.startOp("suspend "+name, "cluster", "suspend", name)
 
 	case "u":
-		if m.selectedKind() == "docker" {
+		if kind == "docker" {
 			return m, nil // the docker sidecar has no kube context
 		}
 		// re-merge ~/.kube/config and switch context to this cluster, fixing a
@@ -574,28 +691,31 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		in.Focus()
 		in.CharLimit = 64
 		in.Width = 24
-		m.input = &nameInput{input: in, cluster: name}
+		ni := &nameInput{input: in, cluster: name}
+		if kind == "docker" {
+			ni.cluster = "docker"
+			ni.docker = true
+		}
+		m.input = ni
 		return m, textinput.Blink
 
 	case "e":
-		if m.focus != paneSnapshots || m.selectedKind() == "docker" {
+		if !m.onSnapshot() || kind == "docker" {
 			return m, nil // docker sidecar snapshots are not exportable
 		}
-		if snap := m.selectedSnapshot(); snap != "" {
-			out := name + "-" + snap + ".k3csnap"
-			return m.startOp("export of "+snap+" to "+out,
-				"snapshot", "export", name, snap, "-o", out)
-		}
-		return m, nil
+		snap := m.curSnapshot()
+		out := name + "-" + snap + ".k3csnap"
+		return m.startOp("export of "+snap+" to "+out,
+			"snapshot", "export", name, snap, "-o", out)
 
 	case "d", "x":
-		if m.focus == paneClusters {
+		if !m.onSnapshot() {
 			deleteOnly := m.opCmd("delete of cluster "+name, "cluster", "delete", name)
 			first := confirm{
 				prompt: fmt.Sprintf("DELETE cluster %q and all its state?", name),
 				cmd:    deleteOnly,
 			}
-			if n := len(m.snapshots); n > 0 {
+			if n := len(m.snapsByMachine[name]); n > 0 {
 				followUp := confirm{
 					prompt: fmt.Sprintf("Also delete its %d snapshot(s)? (y deletes them, n keeps them, esc cancels everything)", n),
 					cmd:    m.opCmd("delete of cluster "+name+" with snapshots", "cluster", "delete", "--snapshots", name),
@@ -606,12 +726,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.confirm = &first
 			return m, nil
 		}
-		snap := m.selectedSnapshot()
-		if snap == "" {
-			return m, nil
-		}
+		snap := m.curSnapshot()
 		del := m.opCmd("delete of snapshot "+snap, "snapshot", "delete", name, snap)
-		if m.selectedKind() == "docker" {
+		if kind == "docker" {
 			del = m.opCmd("delete of docker snapshot "+snap, "docker", "snapshot", "delete", snap)
 		}
 		m.confirm = &confirm{
@@ -624,23 +741,64 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) move(delta int) (tea.Model, tea.Cmd) {
-	if m.focus == paneClusters {
-		next := m.cCur + delta
-		if next < 0 || next >= len(m.clusters) {
-			return m, nil
-		}
-		m.cCur = next
-		m.sCur = 0
-		// never show the previous cluster's snapshots while loading
-		m.snapshots = nil
-		m.snapsLoading = true
-		return m, m.refreshSnapshots()
-	}
-	next := m.sCur + delta
-	if next < 0 || next >= len(m.snapshots) {
+	next := m.cur + delta
+	if next < 0 || next >= len(m.rows) {
 		return m, nil
 	}
-	m.sCur = next
+	prev := m.curName()
+	m.cur = next
+	// the info panel's net line belongs to the previously selected cluster;
+	// blank it until the next refresh recomputes it for the new selection
+	if m.curName() != prev {
+		m.netLine = ""
+	}
+	return m, nil
+}
+
+// expand opens a collapsed machine row, lazy-loading its snapshots if needed.
+func (m model) expand() (tea.Model, tea.Cmd) {
+	r, ok := m.curRow()
+	if !ok || r.kind != rowMachine {
+		return m, nil
+	}
+	c := m.clusters[r.machine]
+	if m.expanded[c.Name] {
+		return m, nil
+	}
+	m.expanded[c.Name] = true
+	var cmd tea.Cmd
+	if _, loaded := m.snapsByMachine[c.Name]; !loaded {
+		m.loading[c.Name] = true
+		cmd = m.refreshSnapshots(c.Name, c.Kind)
+	}
+	m.rebuildRows()
+	return m, cmd
+}
+
+// collapse closes an expanded machine row, or jumps a snapshot row up to its
+// parent machine.
+func (m model) collapse() (tea.Model, tea.Cmd) {
+	r, ok := m.curRow()
+	if !ok {
+		return m, nil
+	}
+	if r.kind == rowSnapshot {
+		for i := m.cur - 1; i >= 0; i-- {
+			if m.rows[i].kind == rowMachine {
+				m.cur = i
+				break
+			}
+		}
+		return m, nil
+	}
+	c := m.clusters[r.machine]
+	if m.expanded[c.Name] {
+		m.expanded[c.Name] = false
+		m.rebuildRows()
+		if m.cur >= len(m.rows) {
+			m.cur = max(0, len(m.rows)-1)
+		}
+	}
 	return m, nil
 }
 
@@ -658,6 +816,55 @@ func (m model) startOp(desc string, args ...string) (tea.Model, tea.Cmd) {
 	return m, m.opCmd(desc, args...)
 }
 
+// --- command log ---
+
+func (m *model) openLog() {
+	m.showLog = true
+	m.sizeLog()
+}
+
+// sizeLog (re)builds the log viewport for the current terminal size.
+func (m *model) sizeLog() {
+	w := m.width - 10
+	if w > 110 {
+		w = 110
+	}
+	if w < 20 {
+		w = 20
+	}
+	h := m.height - 8
+	if h < 5 {
+		h = 5
+	}
+	vp := viewport.New(w, h)
+	vp.SetContent(m.logContent())
+	m.logVP = vp
+}
+
+// logContent renders the whole session's command history, newest first.
+func (m model) logContent() string {
+	if len(m.commands) == 0 {
+		return dimSt.Render("no commands run yet")
+	}
+	var b strings.Builder
+	for i := len(m.commands) - 1; i >= 0; i-- {
+		c := m.commands[i]
+		status := statusOk.Render("✓")
+		if c.err != nil {
+			status = statusBad.Render("✗")
+		}
+		head := "$ k3c " + strings.Join(c.args, " ")
+		b.WriteString(keySt.Render(head) + "  " + status + " " + dimSt.Render(c.when.Format("15:04:05")) + "\n")
+		if c.output != "" {
+			b.WriteString(c.output + "\n")
+		}
+		if i > 0 {
+			b.WriteString(dimSt.Render(strings.Repeat("─", 48)) + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 // --- view ---
 
 var (
@@ -673,9 +880,27 @@ var (
 	selectSt  = lipgloss.NewStyle().Bold(true).Background(accent).Foreground(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#1A1A1A"})
 	statusOk  = lipgloss.NewStyle().Foreground(good)
 	statusBad = lipgloss.NewStyle().Foreground(bad)
-	focusBox  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(0, 1)
-	blurBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(dim).Padding(0, 1)
+	panelBox  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(0, 1)
+	paneBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(accent)
+	dialogBox = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(1, 3)
 )
+
+// dotChar is the uncolored state glyph (used in the selection bar, which can't
+// carry per-segment color).
+func dotChar(state string) string {
+	switch state {
+	case "running":
+		return "●"
+	case "paused":
+		return "◐"
+	case "suspended":
+		return "◌"
+	case "stopped":
+		return "○"
+	default:
+		return "·"
+	}
+}
 
 func stateDot(state string) string {
 	st := lipgloss.NewStyle()
@@ -705,70 +930,111 @@ func (m model) View() string {
 	if m.width == 0 {
 		return "loading…"
 	}
-	if m.showHelp {
+	switch {
+	case m.showLog:
+		return m.logScreen()
+	case m.showHelp:
 		return m.helpScreen()
+	case m.confirm != nil:
+		return m.confirmScreen()
+	case m.input != nil:
+		return m.inputScreen()
 	}
+	return lipgloss.JoinVertical(lipgloss.Left, m.headerView(), m.treeView(), m.statusView())
+}
 
-	leftW := m.width * 2 / 5
-	if leftW < 34 {
-		leftW = 34
-	}
-	rightW := m.width - leftW - 6
-
-	left := m.clustersView(leftW)
-	right := m.snapshotsView(rightW)
-
-	lBox, rBox := blurBox, blurBox
-	if m.focus == paneClusters {
-		lBox = focusBox
-	} else {
-		rBox = focusBox
-	}
-
-	body := lipgloss.JoinHorizontal(lipgloss.Top,
-		lBox.Width(leftW).Render(left),
-		" ",
-		rBox.Width(rightW).Render(right),
+// headerView is the k9s-style top bar: a bordered context info panel beside the
+// shortcut menu.
+func (m model) headerView() string {
+	return lipgloss.JoinHorizontal(lipgloss.Top,
+		panelBox.Render(m.infoPanelView()),
+		"   ",
+		m.keyMenuView(),
 	)
-
-	header := titleSt.Render(" k3c ") + dimSt.Render("· machines & snapshots")
-
-	parts := []string{header, body}
-	if info := m.selectionInfoView(); info != "" {
-		parts = append(parts, info)
-	}
-	parts = append(parts, m.statusView())
-	if m.showOut && m.output != "" {
-		parts = append(parts, blurBox.Width(m.width-4).Render(tail(m.output, 8)))
-	}
-	parts = append(parts, m.helpView())
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
-func (m model) clustersView(width int) string {
-	var b strings.Builder
-	b.WriteString(titleSt.Render("Machines") + "\n")
-	if len(m.clusters) == 0 {
-		b.WriteString(dimSt.Render("no clusters — k3c cluster create"))
-		return b.String()
-	}
-	for i, c := range m.clusters {
-		active := " "
-		if c.Active {
-			active = titleSt.Render("★")
+func panelLabel(s string) string { return dimSt.Render(fmt.Sprintf("%-8s", s)) }
+
+// infoPanelView shows the selected machine plus the contextual net line and the
+// global pull-cache line.
+func (m model) infoPanelView() string {
+	rows := []string{titleSt.Render("k3c") + dimSt.Render(" · machines")}
+	if mc, ok := m.curMachine(); ok {
+		ctx := mc.Context
+		if mc.Kind == "docker" || ctx == "" {
+			ctx = "—"
 		}
-		line := fmt.Sprintf("%s %s %-12s %-7s %-9s %6s",
-			active, stateDot(c.Server), c.Name, typeLabel(c.Kind), c.Server, c.RAM)
-		if i == m.cCur && m.focus == paneClusters {
-			line = selectSt.Render(padRight(stripExtra(c, true), width-2))
-		}
-		b.WriteString(line + "\n")
+		rows = append(rows,
+			panelLabel("machine")+mc.Name+dimSt.Render("  ("+typeLabel(mc.Kind)+" · "+mc.Server+")"),
+			panelLabel("context")+ctx,
+		)
 	}
-	return strings.TrimRight(b.String(), "\n")
+	net := m.netLine
+	if net == "" {
+		net = dimSt.Render("—")
+	}
+	cache := m.cacheLine
+	if cache == "" {
+		cache = dimSt.Render("—")
+	}
+	rows = append(rows, panelLabel("net")+net, panelLabel("cache")+cache)
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
-// typeLabel is the short machine-type tag shown in the list: clusters are k3s
-// VMs; the sidecar is the docker VM.
+// keyMenuView renders the always-on navigation column beside the verbs that
+// apply to the row under the cursor (machine / snapshot / docker sidecar).
+func (m model) keyMenuView() string {
+	parts := []string{renderMenuCol([]helpBind{
+		{"↑↓", "move"},
+		{"←→", "expand"},
+		{"l", "logs"},
+		{"?", "help"},
+		{"q", "quit"},
+	})}
+	ctx := m.menuBinds()
+	const per = 6
+	for i := 0; i < len(ctx); i += per {
+		end := i + per
+		if end > len(ctx) {
+			end = len(ctx)
+		}
+		parts = append(parts, "    ", renderMenuCol(ctx[i:end]))
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+}
+
+// menuBinds picks the contextual verb set for the current row.
+func (m model) menuBinds() []helpBind {
+	r, ok := m.curRow()
+	if !ok {
+		return machineBinds()
+	}
+	kind := m.clusters[r.machine].Kind
+	if kind == "docker" && r.kind == rowMachine {
+		return dockerBinds()
+	}
+	if r.kind == rowSnapshot && r.snapName != "" {
+		return snapshotBinds()
+	}
+	return machineBinds()
+}
+
+func renderMenuCol(binds []helpBind) string {
+	w := 0
+	for _, b := range binds {
+		if k := lipgloss.Width(b.key); k > w {
+			w = k
+		}
+	}
+	var sb strings.Builder
+	for _, b := range binds {
+		sb.WriteString(keySt.Render(padRight(b.key, w)) + " " + dimSt.Render(b.desc) + "\n")
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// typeLabel is the short machine-type tag: clusters are k3s VMs; the sidecar is
+// the docker VM.
 func typeLabel(kind string) string {
 	if kind == "docker" {
 		return "docker"
@@ -776,87 +1042,70 @@ func typeLabel(kind string) string {
 	return "k3s"
 }
 
-// stripExtra renders a machine row without color codes for the selection bar.
-func stripExtra(c cluster.ClusterInfo, selected bool) string {
-	active := " "
-	if c.Active {
-		active = "★"
+func (m model) treeView() string {
+	w := m.width - 2
+	var b strings.Builder
+	b.WriteString(" " + titleSt.Render("Machines") + "\n")
+	if len(m.rows) == 0 {
+		b.WriteString(" " + dimSt.Render("no clusters — k3c cluster create"))
+		return paneBox.Width(w).Render(b.String())
 	}
-	dot := "●"
-	switch c.Server {
-	case "paused":
-		dot = "◐"
-	case "suspended":
-		dot = "◌"
-	case "stopped":
-		dot = "○"
+	for i, r := range m.rows {
+		b.WriteString(m.renderRow(r, w, i == m.cur) + "\n")
 	}
-	return fmt.Sprintf("%s %s %-12s %-7s %-9s %6s",
-		active, dot, c.Name, typeLabel(c.Kind), c.Server, c.RAM)
+	return paneBox.Width(w).Render(strings.TrimRight(b.String(), "\n"))
 }
 
-// selectionInfoView shows details for the highlighted machine — its type and,
-// for a cluster, its kube context — plus its network and pull-cache lines,
-// below the boxes rather than inside the machines list.
-func (m model) selectionInfoView() string {
-	if m.cCur >= len(m.clusters) {
-		return ""
+// renderRow draws one tree line; the selected row is a solid bar (uncolored
+// glyphs, so the highlight background reads cleanly).
+func (m model) renderRow(r treeRow, w int, selected bool) string {
+	if r.kind == rowMachine {
+		c := m.clusters[r.machine]
+		caret := "▸"
+		if m.expanded[c.Name] {
+			caret = "▾"
+		}
+		// the active cluster (the current kube context) is flagged with a
+		// trailing ★ on its name — a leading column read as indentation and
+		// misaligned the names with the nested snapshot rows
+		if selected {
+			name := c.Name
+			if c.Active {
+				name += " ★"
+			}
+			plain := fmt.Sprintf(" %s %s %-14s %-7s %-9s %6s",
+				caret, dotChar(c.Server), name, typeLabel(c.Kind), c.Server, c.RAM)
+			return selectSt.Render(padRight(plain, w))
+		}
+		name := c.Name
+		if c.Active {
+			name += titleSt.Render(" ★")
+		}
+		return fmt.Sprintf(" %s %s %s %-7s %-9s %6s",
+			dimSt.Render(caret), stateDot(c.Server),
+			padRight(name, 14), typeLabel(c.Kind), c.Server, c.RAM)
 	}
-	c := m.clusters[m.cCur]
-	detail := ""
-	if c.Kind != "docker" && c.Context != "" {
-		detail = " · " + c.Context
-	}
-	var b strings.Builder
-	b.WriteString(dimSt.Render(fmt.Sprintf(" %s · %s%s · %s",
-		c.Name, typeLabel(c.Kind), detail, c.Server)))
-	if m.netLine != "" {
-		b.WriteString("\n" + dimSt.Render(" "+m.netLine))
-	}
-	if m.cacheLine != "" {
-		b.WriteString("\n" + dimSt.Render(" "+m.cacheLine))
-	}
-	return b.String()
-}
 
-func (m model) snapshotsView(width int) string {
-	var b strings.Builder
-	name := m.selectedCluster()
-	b.WriteString(titleSt.Render("Snapshots") + dimSt.Render(" of "+name) + "\n")
-	if m.snapsLoading {
-		b.WriteString(m.spin.View() + dimSt.Render(" loading…"))
-		return b.String()
-	}
-	if len(m.snapshots) == 0 {
-		b.WriteString(dimSt.Render("no snapshots — press c to create one"))
-		return b.String()
-	}
-	for i, s := range m.snapshots {
-		mode := dimSt.Render(s.Mode)
-		if s.Mode == "warm" {
-			mode = lipgloss.NewStyle().Foreground(warn).Render(s.Mode)
+	const indent = "     "
+	if r.placeholder != "" {
+		if selected {
+			return selectSt.Render(padRight(indent+r.placeholder, w))
 		}
-		line := fmt.Sprintf("  %-24s %s %s", s.Name, mode, dimSt.Render(s.Created))
-		if i == m.sCur && m.focus == paneSnapshots {
-			line = selectSt.Render(padRight(fmt.Sprintf("  %-24s %-5s %s", s.Name, s.Mode, s.Created), width-2))
-		}
-		b.WriteString(line + "\n")
+		return dimSt.Render(indent + r.placeholder)
 	}
-	return strings.TrimRight(b.String(), "\n")
+	if selected {
+		plain := fmt.Sprintf("%s%-24s %-5s %s", indent, r.snapName, r.snapMode, r.snapWhen)
+		return selectSt.Render(padRight(plain, w))
+	}
+	mode := dimSt.Render(r.snapMode)
+	if r.snapMode == "warm" {
+		mode = lipgloss.NewStyle().Foreground(warn).Render(r.snapMode)
+	}
+	return fmt.Sprintf("%s%-24s %s %s", indent, r.snapName, mode, dimSt.Render(r.snapWhen))
 }
 
 func (m model) statusView() string {
 	switch {
-	case m.confirm != nil:
-		return lipgloss.NewStyle().Foreground(warn).Render(" " + m.confirm.prompt + " (y/N)")
-	case m.input != nil:
-		mode := "warm"
-		if m.input.cold {
-			mode = "cold"
-		}
-		return fmt.Sprintf(" new %s snapshot of %s: %s %s",
-			mode, m.input.cluster, m.input.input.View(),
-			dimSt.Render("(enter save · tab warm/cold · esc cancel · spaces become dashes)"))
 	case m.busy != "":
 		line := ""
 		if m.opLine != "" {
@@ -864,83 +1113,131 @@ func (m model) statusView() string {
 		}
 		return " " + m.spin.View() + " " + m.busy + dimSt.Render(" …") + line
 	case m.status != "" && m.failed:
-		return statusBad.Render(" ✗ " + m.status + " (o shows output)")
+		return statusBad.Render(" ✗ " + m.status + dimSt.Render(" (l shows the command log)"))
 	case m.status != "":
 		return statusOk.Render(" " + m.status)
 	default:
-		return " "
+		return dimSt.Render(" ready")
 	}
 }
 
-// helpView is the condensed bottom bar (always visible); the full keymap is
-// the ?-toggled full-screen helpScreen.
-func (m model) helpView() string {
-	return dimSt.Render(" ↑↓ move · ⇥ switch · ↵ select · c snapshot · ? help · q quit")
+// --- dialogs ---
+
+func (m model) center(box string) string {
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
-// helpBind is one key/description row in the full-screen help.
+func (m model) confirmScreen() string {
+	c := m.confirm
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		titleSt.Render("Confirm"), "",
+		c.prompt, "",
+		dimSt.Render("y yes · n no · esc cancel"))
+	return m.center(dialogBox.Render(content))
+}
+
+func (m model) inputScreen() string {
+	in := m.input
+	warmSeg, coldSeg := "warm", "cold"
+	sel := lipgloss.NewStyle().Bold(true).Foreground(accent)
+	if in.cold {
+		coldSeg = sel.Render("cold")
+	} else {
+		warmSeg = sel.Render("warm")
+	}
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		titleSt.Render("New snapshot of "+in.cluster), "",
+		dimSt.Render("name  ")+in.input.View(),
+		dimSt.Render("mode  ")+warmSeg+dimSt.Render(" / ")+coldSeg, "",
+		dimSt.Render("enter save · tab warm/cold · esc cancel · spaces → dashes"))
+	return m.center(dialogBox.Width(52).Render(content))
+}
+
+func (m model) logScreen() string {
+	title := titleSt.Render(" k3c ") + dimSt.Render("· command log")
+	footer := dimSt.Render(" ↑↓ scroll · esc / o close · q quit")
+	content := lipgloss.JoinVertical(lipgloss.Left, title, m.logVP.View(), footer)
+	return m.center(dialogBox.Render(content))
+}
+
+// helpBind is one key/description row in the menu and the help dialog.
 type helpBind struct{ key, desc string }
 
-// helpScreen renders the full-screen keybinding reference (k9s-style), shown
-// while showHelp is set; any key closes it (see handleKey).
-func (m model) helpScreen() string {
-	col := func(title string, binds []helpBind) string {
-		w := 0
-		for _, b := range binds {
-			if k := lipgloss.Width(b.key); k > w {
-				w = k
-			}
-		}
-		var sb strings.Builder
-		sb.WriteString(titleSt.Render(title) + "\n")
-		for _, b := range binds {
-			sb.WriteString(" " + keySt.Render(padRight(b.key, w)) + "  " + dimSt.Render(b.desc) + "\n")
-		}
-		return strings.TrimRight(sb.String(), "\n")
-	}
-
-	general := col("GENERAL", []helpBind{
-		{"↑ ↓ / j k", "move"},
-		{"⇥", "switch pane"},
-		{"g / F5", "refresh"},
-		{"o", "toggle output"},
-		{"? / esc", "close help"},
-		{"q / ^C", "quit"},
-	})
-	machines := col("MACHINES", []helpBind{
-		{"↵", "activate cluster"},
+// machineBinds, snapshotBinds and dockerBinds are the single source of truth
+// for both the header menu and the help dialog, so the two can't drift.
+func machineBinds() []helpBind {
+	return []helpBind{
+		{"↵", "activate"},
 		{"s", "start"},
 		{"S", "stop"},
 		{"p", "pause"},
 		{"r", "resume"},
 		{"z", "suspend"},
-		{"u", "use-context (kubeconfig)"},
-		{"m", "reclaim memory"},
-		{"M", "release memory"},
-		{"c", "new snapshot"},
-		{"d / x", "delete cluster"},
-	})
-	snapshots := col("SNAPSHOTS", []helpBind{
+		{"u", "use-context"},
+		{"m", "reclaim mem"},
+		{"M", "release mem"},
+		{"c", "snapshot"},
+		{"d/x", "delete"},
+	}
+}
+
+func snapshotBinds() []helpBind {
+	return []helpBind{
 		{"↵", "restore"},
 		{"c", "create"},
-		{"d / x", "delete"},
 		{"e", "export"},
-	})
-	docker := col("DOCKER SIDECAR", []helpBind{
-		{"↵ / s", "up"},
+		{"d/x", "delete"},
+	}
+}
+
+func dockerBinds() []helpBind {
+	return []helpBind{
+		{"↵", "activate"},
+		{"s", "up"},
 		{"S", "down"},
-		{"p / r", "pause / resume"},
+		{"p", "pause"},
+		{"r", "resume"},
 		{"z", "suspend"},
 		{"c", "snapshot"},
-		{"d / x", "remove"},
+		{"d/x", "remove"},
+	}
+}
+
+// helpScreen renders the full keybinding reference dialog (toggled with ?).
+func (m model) helpScreen() string {
+	general := helpCol("GENERAL", []helpBind{
+		{"↑↓ / jk", "move"},
+		{"←→", "expand / collapse"},
+		{"g / F5", "refresh"},
+		{"l", "logs / output"},
+		{"? / esc", "close help"},
+		{"q / ^C", "quit"},
 	})
+	machines := helpCol("MACHINE", machineBinds())
+	snapshots := helpCol("SNAPSHOT", snapshotBinds())
+	docker := helpCol("DOCKER SIDECAR", dockerBinds())
 
 	gap := "    "
 	topRow := lipgloss.JoinHorizontal(lipgloss.Top, general, gap, machines, gap, snapshots)
 	title := titleSt.Render(" k3c ") + dimSt.Render("· keybindings")
 	footer := dimSt.Render(" ? or esc to close")
 	content := lipgloss.JoinVertical(lipgloss.Left, title, "", topRow, "", docker, "", footer)
-	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)
+	return m.center(dialogBox.Render(content))
+}
+
+func helpCol(title string, binds []helpBind) string {
+	w := 0
+	for _, b := range binds {
+		if k := lipgloss.Width(b.key); k > w {
+			w = k
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(titleSt.Render(title) + "\n")
+	for _, b := range binds {
+		sb.WriteString(" " + keySt.Render(padRight(b.key, w)) + "  " + dimSt.Render(b.desc) + "\n")
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 func padRight(s string, width int) string {
@@ -948,14 +1245,6 @@ func padRight(s string, width int) string {
 		return s + strings.Repeat(" ", width-w)
 	}
 	return s
-}
-
-func tail(s string, n int) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	return strings.Join(lines, "\n")
 }
 
 func humanBytes(b int64) string {
