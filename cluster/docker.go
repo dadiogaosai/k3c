@@ -390,6 +390,7 @@ func dockerReady(cfg *config.Config) error {
 	// once before using `k3d cluster create` (see PrepareK3sNodeImages).
 	if ensureDockerContext(cfg, host) {
 		logger.Info("docker context '" + cfg.DockerContext + "' active")
+		warnContextShadowed(cfg)
 		return nil
 	}
 	// no context (docker CLI absent or disabled): fall back to env
@@ -428,6 +429,25 @@ func ensureDockerContext(cfg *config.Config, host string) bool {
 		return false
 	}
 	return true
+}
+
+// warnContextShadowed warns when a DOCKER_HOST or DOCKER_CONTEXT in the
+// environment overrides the context we just activated. The docker CLI resolves
+// the engine in the order DOCKER_HOST, then DOCKER_CONTEXT, then the active
+// context — so either env var (e.g. the DOCKER_HOST OrbStack/Docker Desktop
+// export into your shell) silently keeps `docker` pointed at the wrong engine
+// even though `docker context use` succeeded. `docker context use` prints the
+// same warning to stderr, but we capture its output, so surface it ourselves.
+func warnContextShadowed(cfg *config.Config) {
+	if h := os.Getenv("DOCKER_HOST"); h != "" {
+		logger.Warn("DOCKER_HOST=" + h + " overrides the '" + cfg.DockerContext +
+			"' context, so docker still targets that engine. Run 'unset DOCKER_HOST' to use the sidecar.")
+		return
+	}
+	if c := os.Getenv("DOCKER_CONTEXT"); c != "" && c != cfg.DockerContext {
+		logger.Warn("DOCKER_CONTEXT=" + c + " overrides the '" + cfg.DockerContext +
+			"' context, so docker still targets that engine. Run 'unset DOCKER_CONTEXT' to use the sidecar.")
+	}
 }
 
 // restoreDockerContext switches the docker CLI back to the default context
@@ -552,6 +572,11 @@ func DockerStatus(cfg *config.Config) error {
 				active := "inactive"
 				if strings.TrimSpace(current) == name {
 					active = "active"
+				}
+				if h := os.Getenv("DOCKER_HOST"); h != "" {
+					active += ", shadowed by DOCKER_HOST=" + h
+				} else if c := os.Getenv("DOCKER_CONTEXT"); c != "" && c != name {
+					active += ", shadowed by DOCKER_CONTEXT=" + c
 				}
 				fmt.Println("  context: " + name + " (" + active + ")")
 			}
