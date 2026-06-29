@@ -27,22 +27,22 @@ jobs:
       pull-requests: write
     # macOS arm64: the container app is Swift/Virtualization.framework and
     # only runs on Apple Silicon.
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Checkout container fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ env.CONTAINER_REPO }}
           ref: ${{ env.CONTAINER_REF }}
           path: .forks/container
 
       - name: Checkout containerization fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ env.CONTAINERIZATION_REPO }}
           ref: ${{ env.CONTAINERIZATION_REF }}
@@ -156,7 +156,7 @@ jobs:
         run: go test -tags bundled ./runtime/... -run 'TestBundled' -v
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: '~> v2'
