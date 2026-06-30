@@ -82,3 +82,34 @@ func TestDiagramScrollsOnShortTerminal(t *testing.T) {
 		t.Error("esc did not close the diagram")
 	}
 }
+
+// A diagram wider than the terminal scrolls horizontally so the clipped right
+// side becomes reachable.
+func TestDiagramScrollsHorizontally(t *testing.T) {
+	m := model{
+		width: 56, height: 24,
+		clusters: []cluster.ClusterInfo{
+			{Name: "vehub", Server: "running", RAM: "32GB", Context: "k3d-vehub", Active: true},
+			{Name: "docker", Server: "running", RAM: "48G", Kind: "docker"},
+		},
+		daemons: cluster.DaemonsInfo{State: "running", Pid: "64919",
+			Listeners: []cluster.ListenerState{
+				{Name: "forward", Port: "9480", Detail: "-> 127.0.0.1:3128", Up: true},
+				{Name: "pull-cache", Port: "5011", Up: true},
+			}},
+	}
+	m.openDiagram()
+	before := m.diagramScreen()
+
+	cur := m
+	for i := 0; i < 6; i++ {
+		next, _ := cur.Update(key("l")) // viewport binds l / right to scroll right
+		cur = next.(model)
+	}
+	if !cur.showDiagram {
+		t.Fatal("horizontal scroll key closed the diagram")
+	}
+	if cur.diagramScreen() == before {
+		t.Error("diagram view did not change after scrolling right; horizontal scroll inactive")
+	}
+}

@@ -1862,7 +1862,7 @@ const diagramMinWidth = 46
 
 func (m model) diagramScreen() string {
 	title := titleSt.Render(" k3c ") + dimSt.Render("· system")
-	footer := dimSt.Render(" ↑↓ scroll · D / esc close")
+	footer := dimSt.Render(" ↑↓ ←→ scroll · D / esc close")
 
 	if m.width < diagramMinWidth {
 		body := lipgloss.JoinVertical(lipgloss.Left,
@@ -1957,6 +1957,9 @@ func (m *model) sizeDiagram() {
 		h = 3
 	}
 	vp := viewport.New(w, h)
+	// the diagram is fixed-width art that can be wider than a small terminal, so
+	// allow scrolling left/right as well as up/down.
+	vp.SetHorizontalStep(6)
 	vp.SetContent(content)
 	m.diagramVP = vp
 }

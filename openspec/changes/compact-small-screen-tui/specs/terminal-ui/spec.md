@@ -48,3 +48,9 @@ in the compact presentation.
 - **THEN** the dialog drops its frame to reclaim space and scrolls with the
   cursor/scroll keys, and only its close keys (`?`/`esc` for help, `D`/`esc` for
   the diagram) close it — scroll keys do not
+
+#### Scenario: Scrolling a diagram wider than the terminal
+
+- **WHEN** the system diagram is wider than the terminal
+- **THEN** it scrolls horizontally (←→) as well as vertically so the clipped
+  edges remain reachable
