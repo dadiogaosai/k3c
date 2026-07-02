@@ -43,6 +43,9 @@ func Reclaim(cfg *config.Config, release bool) error {
 	if !containerExists(cfg.ServerName, true) {
 		return fmt.Errorf("cluster '%s' is not running", cfg.Cluster)
 	}
+	if memoryPolicyEnabled(cfg) {
+		return reclaimViaPolicy(cfg, cfg.ServerName, cfg.Memory, "cluster", "k3c cluster suspend && k3c cluster start", release)
+	}
 	return reclaimVM(cfg.ServerName, cfg.Memory, "cluster", "k3c cluster suspend && k3c cluster start", release)
 }
 
@@ -65,7 +68,57 @@ func DockerReclaim(cfg *config.Config, release bool) error {
 	if mem == "" {
 		mem = "8G"
 	}
+	if memoryPolicyEnabled(cfg) {
+		return reclaimViaPolicy(cfg, dockerName, mem, "docker sidecar", "k3c docker suspend && k3c docker up", release)
+	}
 	return reclaimVM(dockerName, mem, "docker sidecar", "k3c docker suspend && k3c docker up", release)
+}
+
+// reclaimViaPolicy is the reclaim path for runtimes with automatic memory
+// policy support: re-arming the policy restarts the runtime's balloon
+// controller, which re-sizes the balloon to the workload within seconds.
+// With release, the policy is switched to manual and the balloon deflated,
+// giving the VM its full configured memory until reclaim re-arms the policy.
+func reclaimViaPolicy(cfg *config.Config, name, fullMem, label, convertHint string, release bool) error {
+	if release {
+		if out, err := runContainer("memory", "policy", name, "manual"); err != nil {
+			return fmt.Errorf("disabling memory policy failed: %s", out)
+		}
+		if out, err := runContainer("memory", "target", name, fullMem); err != nil {
+			return fmt.Errorf("releasing memory failed: %s", out)
+		}
+		logger.Info("memory policy off: the " + label + " has its full " + fullMem + " again (rerun reclaim to re-arm)")
+		return nil
+	}
+
+	before := vmFootprintMB(name)
+	applyMemoryPolicy(cfg, name)
+	logger.Info("memory policy armed; waiting for the runtime's balloon controller")
+
+	// the controller ticks within ~10s and the host frees the ballooned
+	// pages within seconds; wait until the footprint settles
+	after := -1
+	for i := 0; i < 8; i++ {
+		time.Sleep(5 * time.Second)
+		mb := vmFootprintMB(name)
+		if mb < 0 {
+			break
+		}
+		if after >= 0 && after-mb < 64 {
+			after = mb
+			break
+		}
+		after = mb
+	}
+
+	if before > 0 && after > 0 && before-after < 256 {
+		logger.Info(fmt.Sprintf("footprint %dMB -> %dMB", before, after))
+		logger.Info("memory of a freshly booted VM resists reclaim; one suspend/restore cycle")
+		logger.Info("(" + convertHint + ") converts it, then the policy keeps the footprint at the workload")
+		return nil
+	}
+	logger.Info(fmt.Sprintf("reclaimed: %dMB -> %dMB (the runtime keeps sizing the balloon automatically)", before, after))
+	return nil
 }
 
 // reclaimVM drops a VM's guest page caches and inflates its virtio memory

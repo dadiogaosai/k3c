@@ -40,9 +40,10 @@ func runContainer(args ...string) (string, error) {
 
 // capabilities of the container CLI, probed once from its help output.
 type containerCapabilities struct {
-	pause   bool
-	suspend bool
-	memory  bool
+	pause        bool
+	suspend      bool
+	memory       bool
+	memoryPolicy bool // runtime-managed continuous balloon sizing
 }
 
 var (
@@ -56,6 +57,10 @@ func capabilities() containerCapabilities {
 		caps.pause = strings.Contains(out, "\n  pause") && strings.Contains(out, "\n  resume")
 		caps.suspend = strings.Contains(out, "\n  suspend")
 		caps.memory = strings.Contains(out, "\n  memory")
+		if caps.memory {
+			out, _ := runContainer("memory", "--help")
+			caps.memoryPolicy = strings.Contains(out, "policy")
+		}
 	})
 	return caps
 }
@@ -217,6 +222,8 @@ func startServer(cfg *config.Config) error {
 		// into it (used by `k3c image import`)
 		"-v", cfg.ImagesDir() + ":/var/lib/rancher/k3s/agent/images",
 	}
+	// runtime-managed balloon: the footprint follows the workload
+	args = append(args, memoryPolicyCreateArgs(cfg)...)
 	if cfg.TransparentEgress {
 		// dual-NIC: gvnet NIC (default route, transparent egress) + the vmnet
 		// default network (host<->VM, published ports); no CONNECT proxy needed
@@ -526,6 +533,7 @@ func Create(cfg *config.Config) error {
 	if err := setupCoreDNS(cfg); err != nil {
 		return err
 	}
+	convertClusterMemory(cfg)
 	if err := setActive(cfg); err != nil {
 		return err
 	}
@@ -672,6 +680,9 @@ func Start(cfg *config.Config) error {
 		}
 		return err
 	}
+	// VMs created before runtime memory-policy support carry no policy in
+	// their configuration; arm it for this run
+	applyMemoryPolicy(cfg, cfg.ServerName)
 	if err := setActive(cfg); err != nil {
 		return err
 	}

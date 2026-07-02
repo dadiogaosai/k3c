@@ -44,8 +44,17 @@ type FileConfig struct {
 		Sysctls map[string]string `yaml:"sysctls"`
 		// periodically return memory the cluster no longer uses to the
 		// host (balloon-capable container builds): a duration like "10m",
-		// or "off" (default: 10m)
+		// or "off" (default: 10m). Superseded by memoryPolicy on container
+		// builds with runtime memory-policy support.
 		AutoReclaim string `yaml:"autoReclaim"`
+		// continuous memory management of the VMs (memory-policy-capable
+		// container builds): "auto" sizes the memory balloon to the
+		// workload, returning unused memory to the host; "off" disables
+		// (default: auto)
+		MemoryPolicy string `yaml:"memoryPolicy"`
+		// memory kept available for a VM above its workload with
+		// memoryPolicy auto, e.g. "1500M" (default: the runtime's 1G)
+		MemoryHeadroom string `yaml:"memoryHeadroom"`
 		// scheduling priority of the cluster VMs relative to interactive
 		// apps: "low" (clamped below GUI apps, default) or "normal"
 		CPUPriority string `yaml:"cpuPriority"`
@@ -185,6 +194,8 @@ type Config struct {
 
 	ContainerBinary string // the Apple container CLI to use
 	AutoReclaim     string // auto-reclaim interval ("off" disables)
+	MemoryPolicy    string // "auto" (default) or "off"
+	MemoryHeadroom  string // guest memory kept available above the workload ("" = runtime default)
 	CPUPriority     string // "low" (default) or "normal"
 
 	PullCacheEnabled   bool
@@ -312,6 +323,8 @@ func merge(dst *FileConfig, src FileConfig) {
 	i(&dst.LocalRegistry.HostPort, src.LocalRegistry.HostPort)
 	s(&dst.ContainerBinary, src.ContainerBinary)
 	s(&dst.Cluster.AutoReclaim, src.Cluster.AutoReclaim)
+	s(&dst.Cluster.MemoryPolicy, src.Cluster.MemoryPolicy)
+	s(&dst.Cluster.MemoryHeadroom, src.Cluster.MemoryHeadroom)
 	s(&dst.Cluster.CPUPriority, src.Cluster.CPUPriority)
 	l(&dst.CACerts, src.CACerts)
 	l(&dst.Egress.Domains, src.Egress.Domains)
@@ -524,6 +537,8 @@ func Resolve(cluster, projectPath string) (*Config, error) {
 		Registries:          fc.Registries,
 		ContainerBinary:     def(fc.ContainerBinary, "container"),
 		AutoReclaim:         def(fc.Cluster.AutoReclaim, "10m"),
+		MemoryPolicy:        def(fc.Cluster.MemoryPolicy, "auto"),
+		MemoryHeadroom:      fc.Cluster.MemoryHeadroom,
 		CPUPriority:         def(fc.Cluster.CPUPriority, "low"),
 		BaseDir:             baseDir,
 		ConfigFile:          configFile,

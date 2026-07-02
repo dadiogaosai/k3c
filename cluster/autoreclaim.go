@@ -26,6 +26,12 @@ func startAutoReclaim(cfg *config.Config) {
 		logger.Info("auto-reclaim unavailable: container CLI lacks balloon support")
 		return
 	}
+	if capabilities().memoryPolicy {
+		// the runtime's per-VM controller sizes the balloon continuously
+		// (memory policy auto); the coarse periodic loop would fight it
+		logger.Info("auto-reclaim superseded by the runtime's automatic memory policy")
+		return
+	}
 	logger.Info("auto-reclaim every " + interval.String())
 	go func() {
 		// The balloon never deflates on its own: a workload growing into a

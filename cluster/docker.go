@@ -57,6 +57,7 @@ func DockerUp(cfg *config.Config, recreate bool) error {
 	}
 	if containerExists(dockerName, true) {
 		logger.Info("docker sidecar already running")
+		applyMemoryPolicy(cfg, dockerName)
 		return dockerReady(cfg)
 	}
 	if containerExists(dockerName, false) {
@@ -72,6 +73,9 @@ func DockerUp(cfg *config.Config, recreate bool) error {
 			return fmt.Errorf("starting docker sidecar: %s", out)
 		}
 		applyCPUPriority(&config.Config{ServerName: dockerName, CPUPriority: cfg.CPUPriority})
+		// sidecars created before runtime memory-policy support carry no
+		// policy in their configuration; arm it for this run
+		applyMemoryPolicy(cfg, dockerName)
 		return dockerAwait(cfg)
 	}
 
@@ -111,6 +115,8 @@ func DockerUp(cfg *config.Config, recreate bool) error {
 		// without dialing the guest vmnet IP (Phase 2, see ensureDockerForwarder)
 		"--publish-socket", dockerForwardSocketPath(cfg) + ":" + guestForwardSocket,
 	}
+	// runtime-managed balloon: the footprint follows the workload
+	args = append(args, memoryPolicyCreateArgs(cfg)...)
 	if cfg.TransparentEgress {
 		// dual-NIC: vmnet stays primary for the sidecar's gateway services
 		// (proxy, pull-cache, registry at the vmnet gateway) and the cluster's
@@ -157,7 +163,10 @@ func DockerUp(cfg *config.Config, recreate bool) error {
 		return fmt.Errorf("docker sidecar start failed: %s", out)
 	}
 	applyCPUPriority(&config.Config{ServerName: dockerName, CPUPriority: cfg.CPUPriority})
-	return dockerAwait(cfg)
+	if err := dockerAwait(cfg); err != nil {
+		return err
+	}
+	return convertDockerMemory(cfg)
 }
 
 // ensureDockerVolume makes sure the sidecar's image-store volume exists AND is
