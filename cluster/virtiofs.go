@@ -45,3 +45,32 @@ fi`
 	}
 	logger.Info("virtiofs shares remounted")
 }
+
+// repairDockerVirtiofs re-establishes the docker sidecar's /k3c-ca share
+// after a restore from saved machine state (same failure mode as
+// repairVirtiofs). Without it dockerd cannot read the corporate CA bundle
+// (SSL_CERT_FILE) and every TLS pull fails with certificate errors. No-op
+// when the share is healthy.
+func repairDockerVirtiofs() {
+	if _, err := runContainer("exec", dockerName,
+		"sh", "-c", "test -r /k3c-ca/ca-bundle.pem"); err == nil {
+		return
+	}
+	logger.Info("sidecar virtiofs share did not survive the restore; remounting")
+	script := `set -e
+mnt=/run/k3c-vfs
+mkdir -p $mnt
+grep -q " $mnt " /proc/mounts || mount -t virtiofs virtiofs $mnt
+ca=""
+for d in $mnt/*/; do
+  if [ -e "$d/ca-bundle.pem" ]; then ca="$d"; fi
+done
+[ -n "$ca" ] || { echo "no k3c-ca share found"; exit 1; }
+umount -l /k3c-ca 2>/dev/null || true
+mount --bind "$ca" /k3c-ca`
+	if out, err := runContainer("exec", dockerName, "sh", "-c", script); err != nil {
+		logger.Warn("sidecar virtiofs repair failed: " + strings.TrimSpace(out))
+		return
+	}
+	logger.Info("sidecar virtiofs share remounted")
+}

@@ -420,6 +420,10 @@ func applyDockerSysctls(cfg *config.Config) {
 
 // dockerAwait waits until the engine answers, then finalizes the sidecar.
 func dockerAwait(cfg *config.Config) error {
+	// a restored sidecar's virtiofs share (/k3c-ca) can come back dead;
+	// every start path funnels through here, so heal it before the engine
+	// is used (dead share = dockerd cannot read the corporate CA bundle)
+	repairDockerVirtiofs()
 	logger.Info("waiting for the docker engine")
 	for i := 0; i < 60; i++ {
 		if out, err := runContainer("exec", dockerName, "docker", "version", "--format", "{{.Server.Version}}"); err == nil {
