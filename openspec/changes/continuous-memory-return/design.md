@@ -60,3 +60,32 @@ Per-VM `AutoBalloonController` actor in `container-runtime-linux`:
 - Keeping the k3c daemon loop as the controller: 1-minute polling through
   `container exec` is too slow for the pressure path and fights the runtime
   on suspend/restore; the runtime helper owns the VM lifecycle events.
+
+## The 16K kernel (shipped with the release)
+
+On Apple silicon the hypervisor releases ballooned guest memory at host
+page granularity (16K). A 4K guest hands the balloon scattered 4K pages,
+so after real workload churn almost nothing covers a full host page and
+the footprint stays at its high-water mark (measured: a 32G cluster stuck
+at 36G despite an idle 18G workload). With a 16K guest kernel every
+ballooned page is exactly one host page: the same cluster runs at ~19G,
+footprint == dirty == workload. The kernel is built from the kata config
+(k3s-complete, extracted from the previous kernel's IKCONFIG) plus 16K
+pages, balloon compaction, and PSI, and ships prebuilt inside the
+containerization fork (kernel builds need a running container runtime,
+which bundler CI cannot provide). k3c installs it as the container
+default per cluster.kernel: bundled|recommended|keep — "recommended"
+(4K kata) remains for amd64 images, which need Rosetta and therefore
+cannot run on 16K pages.
+
+## Memory-number semantics (measured)
+
+phys_footprint — what Activity Monitor shows — is a commitment ledger,
+not RAM usage: it includes swapped and compressed pages and only shrinks
+when the hypervisor decommits. VZ decommits ballooned pages of fresh-boot
+VMs never, and of restored VMs only freshly inflated ones. In practice:
+fresh/running and cold-restored clusters show the honest workload number
+(the early squeeze keeps commitment from ever growing); warm restores
+re-commit the configured size, and macOS trims the excess under real
+memory pressure (measured: 32G resident → 5.9G under pressure while the
+guest kept running). The k3c TUI should prefer resident-based numbers.

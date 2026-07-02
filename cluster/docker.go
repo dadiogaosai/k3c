@@ -38,8 +38,8 @@ func DockerUp(cfg *config.Config, recreate bool) error {
 	// a paused sidecar's engine cannot answer (dockerReady would hang); lift
 	// any freeze first so `docker up` on a paused sidecar just resumes it
 	dockerResumeIfPaused(cfg)
-	// match the cluster behavior: run the sidecar on a capable kernel
-	EnsureRecommendedKernel()
+	// match the cluster behavior: run the sidecar on the managed kernel
+	EnsureClusterKernel(cfg)
 	// the sidecar pulls through the host proxy and pull-cache mirror, and
 	// its published ports are mirrored to the host — all served by the
 	// daemons, so ensure they run even without a cluster

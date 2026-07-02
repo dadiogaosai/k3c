@@ -3,6 +3,7 @@ package cluster
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,9 @@ import (
 	"runtime"
 
 	"github.com/philipparndt/go-logger"
+
+	"k3c/config"
+	k3cruntime "k3c/runtime"
 )
 
 // Kernel capability detection. The Apple `container` default kernel is a Kata
@@ -38,6 +42,76 @@ func KernelHasModernNetfilter() bool {
 	}
 	return bytes.Contains(cfg, []byte("CONFIG_BRIDGE_NETFILTER=y")) &&
 		bytes.Contains(cfg, []byte("CONFIG_VXLAN=y"))
+}
+
+// EnsureClusterKernel manages the default guest kernel per the cluster
+// config before a VM is created. "bundled" (the default) installs the
+// 16K-page kernel shipped with k3c: on Apple silicon the hypervisor frees
+// ballooned guest memory at host (16K) page granularity, so only a
+// 16K-page guest returns memory reliably — a fragmented 4K guest barely
+// returns anything. The trade-off is Rosetta: amd64 images cannot run on a
+// 16K kernel, so "recommended" selects the runtime's 4K kata kernel for
+// clusters that need them, and "keep" leaves the kernel alone entirely.
+// Existing VMs keep their kernel; only newly created ones pick up changes.
+func EnsureClusterKernel(cfg *config.Config) {
+	switch cfg.Kernel {
+	case "keep":
+		return
+	case "recommended":
+		EnsureRecommendedKernel()
+		return
+	}
+	bundled := k3cruntime.BundledKernel()
+	if bundled == "" {
+		// unbundled dev build: fall back to the previous behavior
+		EnsureRecommendedKernel()
+		return
+	}
+	if kernelFileMatches(bundled) {
+		return
+	}
+	logger.Info("installing the bundled 16K kernel (best host memory return; set cluster.kernel: recommended for amd64/Rosetta workloads)")
+	if out, err := runContainer("system", "kernel", "set", "--binary", bundled, "--force"); err != nil {
+		logger.Warn("could not install the bundled kernel: " + firstLine(out))
+		EnsureRecommendedKernel()
+		return
+	}
+	if !KernelHasModernNetfilter() {
+		logger.Warn("bundled kernel lacks br_netfilter/vxlan?! falling back to the recommended kernel")
+		_, _ = runContainer("system", "kernel", "set", "--recommended")
+	}
+}
+
+// kernelFileMatches reports whether the default container kernel is the
+// given file (by content hash).
+func kernelFileMatches(path string) bool {
+	want, err := fileSHA256(path)
+	if err != nil {
+		return false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	current, err := fileSHA256(filepath.Join(home, "Library", "Application Support",
+		"com.apple.container", "kernels", "default.kernel-"+runtime.GOARCH))
+	if err != nil {
+		return false
+	}
+	return want == current
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // EnsureRecommendedKernel upgrades the default container kernel to the

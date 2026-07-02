@@ -15,9 +15,9 @@ env:
   # release is reproducible and can't silently pick up an untested fork change.
   # Bump these deliberately when the runtime needs a fork update.
   CONTAINER_REPO: philipparndt/container
-  CONTAINER_REF: 3d09fc5b025a1e7d13fdd8520d4cee15b51af37f
+  CONTAINER_REF: 2201d0c744894b96cc6be93082645c9d9a8b899e
   CONTAINERIZATION_REPO: philipparndt/containerization
-  CONTAINERIZATION_REF: 4e7dc2bfa66c4990df96785c88d88d09210e5350
+  CONTAINERIZATION_REF: f6d77ce63b8da070b60644dc765508be87b614c6
 
 jobs:
   goreleaser:
@@ -126,6 +126,12 @@ jobs:
           # egress plugin (the bug that broke cluster create on bundled installs)
           test -x "$STAGE/libexec/container/plugins/container-network-gvnet/bin/container-network-gvnet" \
             || { echo "::error::container-network-gvnet plugin missing from staged runtime"; exit 1; }
+          # the prebuilt 16K guest kernel ships from the pinned containerization
+          # commit (kernel builds need a running container runtime, which CI
+          # cannot provide); k3c installs it as the default kernel on create
+          mkdir -p "$STAGE/kernel"
+          cp .forks/containerization/kernel/vmlinux-16k "$STAGE/kernel/vmlinux-16k" \
+            || { echo "::error::prebuilt 16K kernel missing from the containerization fork"; exit 1; }
           mv /tmp/k3c-init.tar /tmp/k3c-runtime/init.tar
           du -sh /tmp/k3c-runtime
 

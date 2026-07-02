@@ -59,6 +59,11 @@ type FileConfig struct {
 		// boot-time memory returns to the host immediately: "on-create",
 		// or "off" (default: off — the first suspend/snapshot converts)
 		MemoryConvert string `yaml:"memoryConvert"`
+		// guest kernel management: "bundled" (default; install the 16K-page
+		// kernel shipped with k3c — best memory return, but Rosetta/amd64
+		// images cannot run), "recommended" (the runtime's 4K kata kernel;
+		// needed for amd64 images), or "keep" (never touch the kernel)
+		Kernel string `yaml:"kernel"`
 		// scheduling priority of the cluster VMs relative to interactive
 		// apps: "low" (clamped below GUI apps, default) or "normal"
 		CPUPriority string `yaml:"cpuPriority"`
@@ -201,6 +206,7 @@ type Config struct {
 	MemoryPolicy    string // "auto" (default) or "off"
 	MemoryHeadroom  string // guest memory kept available above the workload ("" = runtime default)
 	MemoryConvert   string // "on-create" or "off" (default)
+	Kernel          string // "bundled" (default), "recommended", or "keep"
 	CPUPriority     string // "low" (default) or "normal"
 
 	PullCacheEnabled   bool
@@ -331,6 +337,7 @@ func merge(dst *FileConfig, src FileConfig) {
 	s(&dst.Cluster.MemoryPolicy, src.Cluster.MemoryPolicy)
 	s(&dst.Cluster.MemoryHeadroom, src.Cluster.MemoryHeadroom)
 	s(&dst.Cluster.MemoryConvert, src.Cluster.MemoryConvert)
+	s(&dst.Cluster.Kernel, src.Cluster.Kernel)
 	s(&dst.Cluster.CPUPriority, src.Cluster.CPUPriority)
 	l(&dst.CACerts, src.CACerts)
 	l(&dst.Egress.Domains, src.Egress.Domains)
@@ -546,6 +553,7 @@ func Resolve(cluster, projectPath string) (*Config, error) {
 		MemoryPolicy:        def(fc.Cluster.MemoryPolicy, "auto"),
 		MemoryHeadroom:      fc.Cluster.MemoryHeadroom,
 		MemoryConvert:       def(fc.Cluster.MemoryConvert, "off"),
+		Kernel:              def(fc.Cluster.Kernel, "bundled"),
 		CPUPriority:         def(fc.Cluster.CPUPriority, "low"),
 		BaseDir:             baseDir,
 		ConfigFile:          configFile,

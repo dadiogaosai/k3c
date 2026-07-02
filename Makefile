@@ -17,9 +17,9 @@ LDFLAGS := -s -w \
 # are reproducible; bump deliberately when the runtime needs a fork update.
 FORKS_DIR             ?= tmp
 CONTAINER_REPO        ?= https://github.com/philipparndt/container
-CONTAINER_REF         ?= 3d09fc5b025a1e7d13fdd8520d4cee15b51af37f
+CONTAINER_REF         ?= 2201d0c744894b96cc6be93082645c9d9a8b899e
 CONTAINERIZATION_REPO ?= https://github.com/philipparndt/containerization
-CONTAINERIZATION_REF  ?= 4e7dc2bfa66c4990df96785c88d88d09210e5350
+CONTAINERIZATION_REF  ?= f6d77ce63b8da070b60644dc765508be87b614c6
 CONTAINER_DIR         := $(FORKS_DIR)/container
 CONTAINERIZATION_DIR  := $(FORKS_DIR)/containerization
 RUNTIME_STAGE         := $(FORKS_DIR)/stage
@@ -139,6 +139,9 @@ runtime: forks ## build the fork runtime (container app + init image) into ./tmp
 		cp -R "$$STG/libexec" "$(RUNTIME_STAGE)/libexec"; \
 		test -x "$(RUNTIME_STAGE)/libexec/container/plugins/container-network-gvnet/bin/container-network-gvnet" \
 			|| { echo "ERROR: container-network-gvnet plugin missing from staged runtime — transparent egress would break"; exit 1; }; \
+		mkdir -p "$(RUNTIME_STAGE)/kernel"; \
+		cp "$(CONTAINERIZATION_DIR)/kernel/vmlinux-16k" "$(RUNTIME_STAGE)/kernel/vmlinux-16k" \
+			|| { echo "ERROR: prebuilt 16K kernel missing from the containerization fork — bundled kernel management would break"; exit 1; }; \
 		echo "$$KEY" > "$(RUNTIME_MARKER)"; \
 		echo "fork runtime built ($$KEY)"; \
 	fi

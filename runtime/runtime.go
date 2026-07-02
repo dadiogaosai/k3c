@@ -184,6 +184,35 @@ func GvnetBinary() string {
 	return "gvnet"
 }
 
+// BundledKernel resolves the guest kernel shipped with the bundled runtime
+// (a 16K-page build: on Apple silicon hosts the hypervisor frees ballooned
+// guest memory at host page granularity, so matching page sizes is what
+// makes continuous memory return effective). Returns "" if unavailable
+// (e.g. an unbundled dev build), so the caller falls back to the runtime's
+// recommended kernel. Resolution:
+//
+//  1. K3C_KERNEL_BINARY — explicit path.
+//  2. <bundle>/kernel/vmlinux-16k — shipped in the bundled runtime.
+//  3. <dir of k3c executable>/vmlinux-16k — a sibling of the running k3c.
+func BundledKernel() string {
+	if p := os.Getenv("K3C_KERNEL_BINARY"); p != "" {
+		return p
+	}
+	if HasBundle() {
+		if dir, err := extractBundle(); err == nil {
+			if bin := filepath.Join(dir, "kernel", "vmlinux-16k"); fileExists(bin) {
+				return bin
+			}
+		}
+	}
+	if exe, err := os.Executable(); err == nil {
+		if bin := filepath.Join(filepath.Dir(exe), "vmlinux-16k"); fileExists(bin) {
+			return bin
+		}
+	}
+	return ""
+}
+
 // DockerForwarderBinary resolves the linux/arm64 in-guest docker port forwarder
 // (cmd/k3cdockerfwd), shipped in the bundled runtime. k3c copies it into the
 // sidecar VM and runs it there; it is never executed on the host. Returns "" if
